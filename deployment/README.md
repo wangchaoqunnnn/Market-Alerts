@@ -480,6 +480,54 @@ docker compose exec db pg_isready -U user -d app
 - `DATABASE_URL` 中的 host 不是 `db`（Compose 内部服务名）
 - 用户名/密码/数据库名不匹配
 
+### 2.1 数据库密码认证失败（`password authentication failed for user "user"` / `28P01`）
+
+**症状**：健康检查超时（60s）→ 部署失败，应用日志里是
+
+```
+PostgresError: password authentication failed for user "user"
+code: '28P01', routine: 'auth_failed'
+```
+
+**两个原因，按顺序排查：**
+
+**原因 1（最常见）：`.env` 里 `DB_PASSWORD` 与 `DATABASE_URL` 中的密码不一致**
+
+```bash
+cd /opt/market-alerts/deployment
+grep -E '^(DB_|DATABASE_URL)' .env
+# 期望：DB_PASSWORD 的密码 == DATABASE_URL 里 //user:密码@db 的密码
+```
+
+**原因 2：Postgres 数据卷是「之前用旧密码」初始化的**
+
+> `POSTGRES_PASSWORD` **只在数据卷首次初始化时生效**。之后无论怎么改 `.env`，库内密码都不会变，
+> 而应用却用新密码去连 → 必然 28P01。
+
+**解决（任选一种）：**
+
+```bash
+cd /opt/market-alerts/deployment
+
+# A. 让库内密码与 .env 一致（最推荐，无需知道旧密码）
+#    容器内 unix socket 是 trust 认证，所以不需要密码即可登录后改密码
+set -a; . ./.env; set +a
+docker compose exec db psql -U "$DB_USER" -d "$DB_NAME" \
+  -c "ALTER USER \"$DB_USER\" WITH PASSWORD '$DB_PASSWORD';"
+./deploy.sh build
+
+# B. 把 .env 改回首次使用的旧密码（DB_PASSWORD 与 DATABASE_URL 同步改），然后
+./deploy.sh build
+
+# C. 删除数据卷重建（⚠️ 会清空自选股 / 策略 / 报告历史）
+docker compose down -v && ./deploy.sh build
+```
+
+> ⚠️ 密码含 `@` `:` `/` `#` 等特殊字符时，`DATABASE_URL` 里必须写 **URL 编码**（如 `@` → `%40`），
+> 否则连接串会被解析错，表现也是认证失败。
+>
+> 现在 `./deploy.sh build` 会在启动应用**之前**先校验账号密码，失败会直接给出上面的解法，不用再翻日志。
+
 ### 3. 应用启动失败
 
 **症状**：健康检查不通过，容器不断重启

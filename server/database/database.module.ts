@@ -89,9 +89,37 @@ export class DatabaseModule implements OnApplicationBootstrap {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    for (const stmt of CREATE_TABLE_SQL) {
-      await this.db.execute(sql.raw(stmt));
+    try {
+      for (const stmt of CREATE_TABLE_SQL) {
+        await this.db.execute(sql.raw(stmt));
+      }
+      this.logger.log('数据库表结构初始化完成（watchlist/alert_settings/report_history/screen_strategies）');
+    } catch (error) {
+      const code: string =
+        (error as { code?: string })?.code
+        ?? (error as { cause?: { code?: string } })?.cause?.code
+        ?? '';
+      if (code === '28P01') {
+        this.logger.error(
+          '数据库密码认证失败（28P01）。请确认：'
+          + '① .env 里 DB_PASSWORD 与 DATABASE_URL 中的密码完全一致；'
+          + '② POSTGRES_PASSWORD 只在数据卷「首次初始化」时生效 —— 若之前用旧密码启动过，'
+          + '改回旧密码，或执行 docker compose exec db psql -U <DB_USER> -d <DB_NAME> '
+          + '-c "ALTER USER <DB_USER> WITH PASSWORD \'新密码\';" 更新库内密码，'
+          + '或 docker compose down -v 删除数据卷重建（会清空数据）。',
+        );
+      } else if (code === 'ECONNREFUSED' || code === 'ENOTFOUND') {
+        this.logger.error(
+          `数据库连接失败（${code}）：请确认 db 容器已启动且健康（docker compose ps），`
+          + '并检查 DATABASE_URL 中的 host 是否为 compose 服务名 db。',
+        );
+      } else {
+        this.logger.error(
+          `数据库初始化失败（${code || '未知错误'}）：请检查 .env 的 DATABASE_URL，`
+          + '以及 db 容器日志（docker compose logs db）。',
+        );
+      }
+      throw error;
     }
-    this.logger.log('数据库表结构初始化完成（watchlist/alert_settings/report_history/screen_strategies）');
   }
 }

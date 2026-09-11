@@ -107,6 +107,82 @@ print_error_logs() {
   echo -e "${RED}===============================${NC}"
 }
 
+# 从 .env 读取变量（不存在时用默认值）
+read_env_var() {
+  local key="$1" default="$2" value=""
+  if [ -f "$ENV_FILE" ]; then
+    value="$(grep -E "^${key}=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"'"'"' \r')"
+  fi
+  if [ -z "$value" ]; then
+    echo "$default"
+  else
+    echo "$value"
+  fi
+}
+
+# 预检：.env 中的数据库账号密码能否真正登录
+# 背景：PostgreSQL 的 POSTGRES_PASSWORD 只在数据卷「首次初始化」时生效，
+#       之后改 .env 不会同步修改库内密码，会出现 28P01 password authentication failed。
+# 注意：官方镜像的 pg_hba.conf 对回环地址（local / 127.0.0.1）是 trust，
+#       只有非回环连接才走 scram-sha-256，所以必须用 db 容器自身 IP 才能验证密码。
+check_db_credentials() {
+  local db_user db_pass db_name db_host
+  db_user="$(read_env_var DB_USER user)"
+  db_pass="$(read_env_var DB_PASSWORD pass)"
+  db_name="$(read_env_var DB_NAME app)"
+
+  db_host="$(docker compose -f "$COMPOSE_FILE" exec -T db hostname -i 2>/dev/null | tr -d ' \r' | awk '{print $1}')"
+  if [ -z "$db_host" ]; then
+    print_warn "无法获取 db 容器 IP，跳过数据库账号密码预检"
+    return 0
+  fi
+
+  # 用 PGPASSWORD 传密码，避免密码含 @ : / 等字符时连接串解析出错
+  if docker compose -f "$COMPOSE_FILE" exec -T -e PGPASSWORD="$db_pass" db \
+      psql -h "$db_host" -p 5432 -U "$db_user" -d "$db_name" -tAc 'select 1' > /dev/null 2>&1; then
+    print_success "数据库账号密码校验通过（${db_user}@${db_name}）"
+    return 0
+  fi
+
+  print_error "数据库账号密码校验失败：无法用 ${db_user} 登录 ${db_name}"
+  echo ""
+  echo -e "${YELLOW}  常见原因：POSTGRES_PASSWORD 只在数据卷「首次初始化」时生效。"
+  echo -e "  若之前用旧密码启动过数据库，改 .env 里的 DB_PASSWORD 不会修改库内已有密码。${NC}"
+  echo ""
+  echo "  三种解决方式（任选其一）："
+  echo "   A. 把 .env 里的 DB_PASSWORD 改回首次使用的旧密码（同时同步 DATABASE_URL）"
+  echo "   B. 用旧密码登录数据库后修改库内密码："
+  echo "      docker compose -f ${COMPOSE_FILE} exec db psql -U ${db_user} -d ${db_name} \\"
+  echo "        -c \"ALTER USER \\\"${db_user}\\\" WITH PASSWORD '新密码';\""
+  echo "   C. 删除数据卷重建（⚠️ 会清空自选股 / 策略 / 报告历史）："
+  echo "      docker compose -f ${COMPOSE_FILE} down -v && ${0} build"
+  echo ""
+  echo "   另请确认 DATABASE_URL 中的密码与 DB_PASSWORD 完全一致；"
+  echo "   密码含 @ : / 等特殊字符时需写成 URL 编码（如 @ → %40）。"
+  echo ""
+  return 1
+}
+
+# 健康检查失败时，按日志内容给出针对性定位
+print_failure_hint() {
+  local logs
+  logs="$(docker compose -f "$COMPOSE_FILE" logs --tail=80 app 2>&1 || true)"
+  if echo "$logs" | grep -q '28P01\|password authentication failed'; then
+    echo ""
+    print_error "定位：数据库密码认证失败（28P01）"
+    echo "  .env 的 DB_PASSWORD 必须与 DATABASE_URL 中的密码一致；"
+    echo "  且 POSTGRES_PASSWORD 只在数据卷首次初始化时生效（详见 ${0} 运行时的提示）。"
+  elif echo "$logs" | grep -q 'ECONNREFUSED'; then
+    echo ""
+    print_error "定位：数据库连接被拒绝"
+    echo "  检查 db 容器：docker compose -f ${COMPOSE_FILE} ps ；docker compose -f ${COMPOSE_FILE} logs db"
+  elif echo "$logs" | grep -q '缺少 DATABASE_URL'; then
+    echo ""
+    print_error "定位：缺少 DATABASE_URL 环境变量"
+    echo "  请对照 .env.example 补全 ${ENV_FILE} 后再执行 ${0} build"
+  fi
+}
+
 # ---------- 命令处理 ----------
 CMD="${1:-build}"
 
@@ -191,16 +267,31 @@ fi
 
 print_success "镜像准备完成"
 
-# ---------- Step 4: 停止旧容器并启动新容器 ----------
+# ---------- Step 4: 启动数据库 → 预检账号密码 → 启动应用 ----------
 print_step 4 5 "启动服务..."
 
-# 先尝试优雅停止旧容器（如存在）
+# 先只启动数据库，等待健康后再校验账号密码（避免应用带着错误配置反复重启）
+docker compose -f "$COMPOSE_FILE" up -d db
+for _ in $(seq 1 30); do
+  if docker compose -f "$COMPOSE_FILE" ps db 2>/dev/null | grep -q 'healthy'; then
+    break
+  fi
+  sleep 2
+done
+
+if ! check_db_credentials; then
+  echo -e "${RED}=== db 容器日志（最近 20 行）===${NC}"
+  docker compose -f "$COMPOSE_FILE" logs --tail=20 db 2>&1 || true
+  exit 1
+fi
+
+# 先尝试优雅停止旧的应用容器（如存在）
 if docker compose -f "$COMPOSE_FILE" ps -q app 2>/dev/null | grep -q .; then
   echo "  停止旧容器..."
   docker compose -f "$COMPOSE_FILE" stop app -t 10
 fi
 
-# 启动全部服务
+# 启动应用（数据库已就绪）
 docker compose -f "$COMPOSE_FILE" up -d
 
 print_success "服务已启动"
@@ -211,6 +302,7 @@ print_step 5 5 "健康检查..."
 if ! wait_for_health; then
   print_error "服务启动失败"
   print_error_logs
+  print_failure_hint
   exit 1
 fi
 
