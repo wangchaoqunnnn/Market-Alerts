@@ -1,0 +1,9 @@
+# 部署相关文件强制 LF 换行。
+# Windows 上 core.autocrlf=true 会把工作区文本转成 CRLF，而：
+#   - .dockerignore 的规则会把行尾 \r 当成模式的一部分，导致 node_modules 等规则失效；
+#   - Dockerfile 的多行 RUN 依赖 "\\" 续行，CRLF 会破坏续行/shell 命令；
+#   - *.sh 在 Linux 容器/服务器上执行时 CRLF 会报 "bad interpreter"。
+/.dockerignore          text eol=lf
+/deployment/Dockerfile  text eol=lf
+/deployment/*.sh        text eol=lf
+/scripts/*.sh           text eol=lf

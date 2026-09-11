@@ -1,33 +1,72 @@
 # ============================================
-# Stage 1: Builder
-# 构建阶段：安装全部依赖并编译前后端
+# 盘中异动监控系统 - 生产镜像（多阶段构建）
+#
+# 针对「npm install ETIMEDOUT / 构建 30 分钟仍失败」的加固点：
+#   1. npm ci 严格按 package-lock.json 安装 —— 不做版本解析，请求数量与版本完全确定；
+#   2. npm 缓存挂载为 BuildKit cache —— 构建失败重试/重复构建不再重新下载 1500+ 个 tarball；
+#   3. 全程只联网安装一次 —— production 阶段直接复用构建阶段裁剪后的 node_modules；
+#   4. 镜像源可用 --build-arg 覆盖（云厂商内网源免流量更快），主源失败自动回退备用源；
+#   5. 强制 IPv4 优先 —— 云服务器 IPv6 不通时 npm 会一直等到超时（典型 ETIMEDOUT）。
+#
+# 注意：RUN --mount 需要 BuildKit（Docker 23+ 默认开启，docker compose 也默认走 BuildKit）。
+# ============================================
+
+# ============================================
+# Stage 1: Builder —— 安装依赖并编译前后端
 # ============================================
 FROM node:22-alpine AS builder
 
-# 国内镜像源加速（容器内 npm install 默认走官方源，国内服务器极慢）
-ENV npm_config_registry=https://registry.npmmirror.com
-# npm 网络健壮性：重试 5 次、单次超时 10 分钟、退避 20s-120s（镜像站偶发限流/超时）
-ENV npm_config_fetch_retries=5 \
-    npm_config_fetch_timeout=600000 \
-    npm_config_fetch_retry_mintimeout=20000 \
-    npm_config_fetch_retry_maxtimeout=120000
+# 镜像源（国内服务器建议换成云厂商内网源，免流量且更稳）：
+#   腾讯云：https://mirrors.cloud.tencent.com/npm/
+#   华为云：https://repo.huaweicloud.com/repository/npm/
+#   阿里云：https://registry.npmmirror.com
+# 用法：docker compose build --build-arg NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG NPM_FALLBACK_REGISTRY=https://registry.npmjs.org
+
+# npm 行为统一在这里配置：
+#   replace_registry_host=always  lockfile 中写死了 npmmirror 的 tarball 地址，
+#                                 换源时必须允许重写 host，否则 --registry 不起作用
+#   maxsockets=6                  npmmirror 对高并发连接会限流/重置，降低并发反而更稳
+#   fetch_timeout=180000          原来的 10 分钟太长：卡住的连接会白等 10 分钟才重试
+#   fetch_retries=8               快速失败+重试，配合缓存挂载重试代价很低
+#   prefer_offline=true           已下载过的一律走缓存，显著减少网络请求
+ENV npm_config_registry=$NPM_REGISTRY \
+    npm_config_replace_registry_host=always \
+    npm_config_maxsockets=6 \
+    npm_config_fetch_timeout=180000 \
+    npm_config_fetch_retries=8 \
+    npm_config_fetch_retry_mintimeout=5000 \
+    npm_config_fetch_retry_maxtimeout=60000 \
+    npm_config_prefer_offline=true \
+    npm_config_audit=false \
+    npm_config_fund=false \
+    npm_config_update_notifier=false
+
+# 云服务器/容器若 IPv6 不通，Node 会先连 IPv6 并一直等到超时（典型 ETIMEDOUT），强制优先 IPv4
+ENV NODE_OPTIONS=--dns-result-order=ipv4first
 
 WORKDIR /app
 
-# 安装构建所需的系统依赖（部分 native 包需要编译）
+# 构建所需的系统依赖（部分 native 包需要源码编译）
 RUN apk add --no-cache python3 make g++
 
-# 先复制包管理文件，利用 Docker 缓存
-# 只要 package.json 不变，这一层就不会重建
-COPY package.json package-lock.json* ./
+# 先复制包管理文件，利用 Docker 层缓存（package.json 不变则这一层及安装层可复用）
+COPY package.json package-lock.json ./
 
-# 移除模板脚手架残留的 postinstall 钩子（fullstack-cli 在容器内不存在，会导致 npm install 失败）
+# 移除模板脚手架残留的 postinstall 钩子（容器内没有 fullstack-cli，会导致 npm install 失败）
 RUN npm pkg delete scripts.postinstall || true
 
-# 安装所有依赖（含 devDependencies，用于构建）
-RUN npm install --production=false
+# 安装依赖（含 devDependencies，构建需要）
+# --mount=type=cache：npm 缓存跨构建复用，失败重试时已下载的包不会重新下载
+RUN --mount=type=cache,id=npm-cache,target=/root/.npm,sharing=locked \
+    sh -c 'FALLBACK="${NPM_FALLBACK_REGISTRY:-https://registry.npmjs.org}"; \
+      npm ci --include=dev --no-audit --no-fund \
+      || { echo ">>> 【警告】$npm_config_registry 安装失败，自动切换备用源 $FALLBACK 重试"; \
+           npm ci --include=dev --no-audit --no-fund --registry="$FALLBACK" \
+           || npm install --include=dev --no-audit --no-fund --registry="$FALLBACK"; }'
 
-# 复制源代码
+# 复制源码与构建配置
 COPY client ./client
 COPY server ./server
 COPY shared ./shared
@@ -37,45 +76,56 @@ COPY vite.config.ts ./
 COPY tailwind.config.ts ./
 COPY postcss.config.js ./
 
-# 执行生产构建
+# 执行生产构建（nest build + vite build）
 RUN npm run build:prod
 
+# 规范化前端 HTML 位置 + 清理 sourcemap：
+# 1) 平台构建（MIAODA_APP_TYPE=3）时 vite 插件会把 HTML 挪到 dist/client/index.html；
+#    自建构建下产物落在 dist/client/client/index.html，而 server 的视图目录固定为
+#    <cwd>/dist/client（server/main.ts: setBaseViewsDir），缺 index.html 时首页返回 500。
+#    此处兜底拷贝一次，并在缺失时直接让构建失败（好过部署后才发现首页打不开）。
+# 2) 删除 *.map（约 13MB）：本镜像同源直出 dist/client，留着等于把前端源码对外暴露。
+#    若生产环境需要 sourcemap 排查问题，删掉下面这行 find 即可。
+RUN set -eux; \
+    if [ ! -f dist/client/index.html ]; then \
+      src="$(find dist/client -maxdepth 3 -name index.html -type f | head -n 1)"; \
+      if [ -n "$src" ]; then cp "$src" dist/client/index.html; echo "normalized view: $src -> dist/client/index.html"; fi; \
+    fi; \
+    test -f dist/client/index.html; \
+    find dist/client -type f -name '*.map' -exec rm -f {} + || true
+
+# 就地裁剪 devDependencies（不再联网装第二遍），失败只告警，不影响启动
+RUN --mount=type=cache,id=npm-cache,target=/root/.npm,sharing=locked \
+    npm prune --omit=dev || echo ">>> 【警告】npm prune 失败，镜像内将保留 devDependencies（不影响运行）"
+
 # ============================================
-# Stage 2: Runner
-# 运行阶段：仅保留生产依赖和编译产物
+# Stage 2: Runner —— 仅保留生产依赖与编译产物
 # ============================================
 FROM node:22-alpine AS production
 
-# 国内镜像源加速
-ENV npm_config_registry=https://registry.npmmirror.com
-# npm 网络健壮性：重试 5 次、单次超时 10 分钟、退避 20s-120s
-ENV npm_config_fetch_retries=5 \
-    npm_config_fetch_timeout=600000 \
-    npm_config_fetch_retry_mintimeout=20000 \
-    npm_config_fetch_retry_maxtimeout=120000
-
 WORKDIR /app
+
+# SERVER_HOST 必须为 0.0.0.0：代码默认值是 localhost，只绑定 127.0.0.1，
+# 容器外的端口映射会连不上（宿主机/浏览器无法访问，deploy.sh 健康检查也会失败）
+ENV NODE_ENV=production \
+    SERVER_HOST=0.0.0.0 \
+    SERVER_PORT=3000
+# 行情数据源多为国内公网接口，同样强制 IPv4 优先，避免 IPv6 黑洞导致请求超时
+ENV NODE_OPTIONS=--dns-result-order=ipv4first
 
 # 安装健康检查所需的 curl
 RUN apk add --no-cache curl
 
-# 设置生产环境
-ENV NODE_ENV=production
-
-# 创建非 root 用户，提升安全性
+# 创建非 root 用户（提升安全性）
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
-# 先复制包管理文件（缓存层）
-COPY package.json package-lock.json* ./
-
-# 移除 postinstall 钩子，避免 fullstack-cli 不存在导致安装失败
-RUN npm pkg delete scripts.postinstall || true
-
-# 仅安装生产依赖，并清理 npm 缓存减小镜像体积
-RUN npm install --production=true && npm cache clean --force
-
-# 从构建阶段复制编译产物
+# 从构建阶段复制裁剪后的生产依赖与编译产物（不再联网安装）
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
+
+# 预留日志目录权限（应用若配置 LOG_DIR=./logs 时可写）
+RUN mkdir -p /app/logs && chown -R appuser:appgroup /app/logs
 
 # 切换到非 root 用户
 USER appuser
@@ -85,8 +135,8 @@ EXPOSE 3000
 
 # 健康检查：轮询 /api/health 端点
 # 间隔 30 秒，超时 5 秒，重试 3 次后标记为 unhealthy
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
-  CMD curl -f http://localhost:3000/api/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20s \
+  CMD curl -f http://127.0.0.1:3000/api/health || exit 1
 
 # 启动命令：直接用 node 启动，减少 npm 中间进程
 CMD ["node", "dist/server/main.js"]

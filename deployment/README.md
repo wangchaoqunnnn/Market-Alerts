@@ -4,7 +4,7 @@
 
 | 组件 | 最低版本 | 说明 |
 |------|----------|------|
-| Docker | >= 20.0 | 容器运行时（推荐部署方式） |
+| Docker | >= 23.0（推荐） | 容器运行时；Dockerfile 使用了 BuildKit 缓存挂载（`RUN --mount=type=cache`），Docker 23+ 默认开启 |
 | Docker Compose | >= 2.0 | 容器编排 |
 | Node.js | >= 22.0.0 | 手动部署或开发时需要 |
 | npm | >= 10.0.0 | 手动部署或开发时需要 |
@@ -30,6 +30,113 @@ cp .env.example .env
 
 ---
 
+## 部署到云服务器（完整步骤）
+
+> 适用：Ubuntu 20.04+ / Debian 11+ / CentOS 7+ 等 Linux 云服务器（境内机房）。
+> 镜像内置真实行情数据源（东方财富 / 腾讯 / 新浪），服务器需能访问这些行情域名。
+
+### 0. 服务器准备
+
+```bash
+# 配置建议：2 核 4G 起（构建阶段吃内存）；若用「本地构建 + 上传镜像」，1 核 2G 也能跑
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+docker version && docker compose version      # Docker 需 >= 23
+
+# 时区必须是 Asia/Shanghai：A 股交易时段（09:30-11:30 / 13:00-15:00）判断依赖本地时间
+timedatectl set-timezone Asia/Shanghai
+
+# 安全组 / 防火墙：放行 3000；生产环境建议只放行 80/443，由 Nginx 转发
+```
+
+### 1. 把代码放到服务器
+
+```bash
+# 方式 A：Git（⚠️ 本地改动必须先 commit + push，否则服务器上拉到的还是旧代码）
+git clone <你的仓库地址> /opt/market-alerts
+
+# 方式 B：本地上传（不依赖 Git）
+rsync -av --exclude node_modules --exclude dist --exclude .git --exclude logs \
+  ./ root@<服务器IP>:/opt/market-alerts/
+```
+
+### 2. 配置环境变量（必改 2 项）
+
+```bash
+cd /opt/market-alerts/deployment
+cp .env.example .env
+vi .env
+```
+
+| 变量 | 说明 |
+|------|------|
+| `DB_PASSWORD` | 改成强密码；**同时**把 `DATABASE_URL` 里的密码改成同一个值（否则容器连不上库） |
+| `SESSION_SECRET` | 会话密钥，`openssl rand -hex 32` 生成 |
+| `MARKET_DATA_SOURCE` | 保持默认 `auto`（真实行情，失败自动切换备用源） |
+
+### 3. 构建并启动（二选一）
+
+**方式 A：服务器直接构建**（简单，需要 npm 网络通畅）
+
+```bash
+cd /opt/market-alerts/deployment
+NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/ ./deploy.sh build
+```
+
+> 腾讯云用 `https://mirrors.cloud.tencent.com/npm/`，华为云用 `https://repo.huaweicloud.com/repository/npm/`，
+> 其他可省略该变量走默认 npmmirror。脚本会自动：构建镜像 → 启动 app+db → 轮询健康检查。
+
+**方式 B：本地构建 → 上传镜像**（服务器网络差或配置低时推荐）
+
+```bash
+# ① 本地（网络正常）构建 linux/amd64 镜像
+docker buildx build --platform linux/amd64 -t market-anomaly-monitor:latest -f deployment/Dockerfile .
+
+# ② 压缩上传并导入（约 150-400MB）
+docker save market-anomaly-monitor:latest | gzip -1 | ssh root@<服务器IP> 'gunzip | docker load'
+
+# ③ 服务器：只启动，不重新构建
+cd /opt/market-alerts/deployment
+cp -n .env.example .env && vi .env
+docker compose up -d --no-build
+```
+
+### 4. 验证部署
+
+```bash
+cd /opt/market-alerts/deployment
+docker compose ps                    # app 应为 Up (healthy)，db 为 Up (healthy)
+curl -s http://localhost:3000/api/health
+curl -s "http://localhost:3000/api/market-data/market-coverage"   # 覆盖度：应为 5900 只左右、五大板块齐全
+docker compose logs app | grep -E '行情数据源|真实行情已就绪|沪市主板|创业板|北交所' | tail -8
+```
+
+浏览器打开 **http://<服务器IP>:3000**，应能看到涨速榜/涨停/炸板等真实行情页面。
+
+### 5. 日常运维
+
+```bash
+./deploy.sh logs                     # 实时日志
+./deploy.sh restart                  # 重启
+./deploy.sh down                     # 停止服务
+docker compose up -d --build app     # 更新代码后重建并启动（方式 A）
+docker compose logs --tail=100 app   # 排查
+
+# 数据库备份 / 恢复（详见「数据备份」章节）
+docker compose exec db pg_dump -U user app > backup_$(date +%F).sql
+```
+
+### 6. 上线检查清单
+
+- [ ] `DB_PASSWORD` 已改，且与 `DATABASE_URL` 中的密码一致
+- [ ] `SESSION_SECRET` 已改为随机值
+- [ ] 5432 未对公网开放（compose 默认只绑定 `127.0.0.1`）
+- [ ] 服务器可访问 `push2.eastmoney.com`、`push2ex.eastmoney.com`、`qt.gtimg.cn`、`hq.sinajs.cn`
+- [ ] `/api/health` 返回 `ok`；`/api/market-data/market-coverage` 五大板块齐全
+- [ ] 需要域名 / HTTPS：前置 Nginx（compose 中 nginx 服务已预留，取消注释即可）
+
+---
+
 ## 环境变量说明
 
 所有环境变量均在 `.env` 文件中配置，首次部署请从 `.env.example` 复制。
@@ -38,7 +145,10 @@ cp .env.example .env
 
 | 变量名 | 默认值 | 必填 | 说明 |
 |--------|--------|------|------|
-| `PORT` | `3000` | 否 | HTTP 服务监听端口 |
+| `SERVER_HOST` | `0.0.0.0` | 否 | 服务监听地址。**容器内必须为 `0.0.0.0`**，代码默认 `localhost` 只绑定 `127.0.0.1`，会导致宿主机访问不到映射端口 |
+| `SERVER_PORT` | `3000` | 否 | HTTP 服务监听端口（需与 `docker-compose.yml` 的端口映射一致） |
+| `PORT` | `3000` | 否 | 兼容旧配置的占位变量，**服务代码不读取**，实际以 `SERVER_PORT` 为准 |
+| `LOG_DIR` | `/app/logs` | 否 | 日志目录，应用写入 `<LOG_DIR>/server.log`（镜像内已创建并授权给非 root 用户） |
 | `NODE_ENV` | `production` | 否 | 运行环境：`production` / `development` |
 | `DATABASE_URL` | - | 是 | PostgreSQL 数据库连接字符串，格式：`postgresql://user:pass@db:5432/app` |
 
@@ -46,9 +156,17 @@ cp .env.example .env
 
 | 变量名 | 默认值 | 必填 | 说明 |
 |--------|--------|------|------|
-| `MARKET_DATA_SOURCE` | `mock` | 否 | 行情数据源：`mock` / `eastmoney` / `tencent` |
-| `REFRESH_INTERVAL_MS` | `1000` | 否 | 行情刷新间隔，单位毫秒 |
-| `MAX_STOCKS` | `200` | 否 | 最大监控股票数量 |
+| `MARKET_DATA_SOURCE` | `auto` | 否 | 行情数据源：`auto`（东财为主、失败自动切换）/ `eastmoney` / `tencent` / `sina` / `mock`（仅离线演示） |
+| `REFRESH_INTERVAL_MS` | `5000` | 否 | 行情刷新间隔，单位毫秒（真实数据源建议 ≥ 3000） |
+| `FULL_SNAPSHOT_INTERVAL_MS` | `60000` | 否 | 全市场快照刷新间隔，单位毫秒（东财列表每页 100 条，需分页拉取） |
+| `MAX_STOCKS` | `8000` | 否 | 最大监控股票数量（真实全 A 约 5900 只） |
+
+> 📈 行情为**真实数据**：东方财富（全市场列表/快照/涨速、涨停池、炸板池、单只详情、概念、财务）
+> 为主源，腾讯财经 / 新浪财经为备用源，日K线取自新浪；股票池覆盖沪市主板、深市主板、
+> 创业板、科创板、北交所全部号段，可通过 `GET /api/market-data/market-coverage` 查看覆盖情况。
+> 只有当显式设置 `MARKET_DATA_SOURCE=mock`，或所有真实源都不可用时，才会回退到模拟引擎。
+> ⚠️ 服务器需能访问 `push2.eastmoney.com`、`push2ex.eastmoney.com`、`qt.gtimg.cn`、`hq.sinajs.cn`
+> 等行情域名（境内云服务器正常可访问；若出网受限请放行这些域名）。
 
 ### WebSocket 配置
 
@@ -288,13 +406,74 @@ docker compose ps
 docker compose exec app sh
 ```
 
-### 4. Docker 构建失败
+### 4. 构建失败 / 构建极慢（npm install ETIMEDOUT）
+
+**症状**：
+
+```
+[+] Building 1768.7s (14/26)
+=> [builder  6/15] RUN npm install --production=false        1767.6s
+npm error code ETIMEDOUT
+npm error network request to https://registry.npmmirror.com/yauzl/-/yauzl-3.4.0.tgz failed
+failed to solve: process "/bin/sh -c npm install --production=false" did not complete successfully
+```
+
+**原因**：镜像内 npm 要从镜像源下载 1500+ 个 tarball，服务器到镜像源的网络抖动/限流会让个别包超时；
+原来的写法还有 3 个放大问题：① `npm install` 会做版本解析且失败后从头再来；
+② builder 与 production 两个阶段**并行**各装一遍依赖，互相抢带宽；
+③ npm 缓存没有跨构建复用，重试等于全部重新下载。
+
+**现在的 Dockerfile 已修复**：
+
+| 加固点 | 说明 |
+|--------|------|
+| `npm ci` | 严格按 `package-lock.json` 安装，不做版本解析，请求数与版本完全确定 |
+| BuildKit cache 挂载 | `--mount=type=cache,id=npm-cache,target=/root/.npm`，失败重试/重复构建复用已下好的包 |
+| 只装一次 | production 阶段直接复用 builder 裁剪后的 `node_modules`，不再并行装第二遍 |
+| 超时/重试调优 | `fetch-timeout=180s`（原 600s）、`fetch-retries=8`、`maxsockets=6`（降低并发避免被限流） |
+| 强制 IPv4 | `NODE_OPTIONS=--dns-result-order=ipv4first`，规避云服务器 IPv6 黑洞导致的 ETIMEDOUT |
+| 备用源自动回退 | 主源失败自动用 `NPM_FALLBACK_REGISTRY` 重试一次 |
+
+**换源构建**（推荐用云厂商内网源，免流量且稳定）：
+
+```bash
+cd deployment
+
+# 方式一：用环境变量覆盖（推荐，配合一键脚本）
+NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/ ./deploy.sh build
+
+# 方式二：直接给 compose 传 build-arg
+docker compose build \
+  --build-arg NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/ \
+  --build-arg NPM_FALLBACK_REGISTRY=https://registry.npmjs.org \
+  app
+docker compose up -d
+```
+
+可选的镜像源：腾讯云 `https://mirrors.cloud.tencent.com/npm/`、
+华为云 `https://repo.huaweicloud.com/repository/npm/`、
+阿里云 `https://registry.npmmirror.com`、官方 `https://registry.npmjs.org`。
+
+**仍然反复超时？改为「本地构建镜像 → 传到服务器」**（最稳，服务器无需访问 npm）：
+
+```bash
+# ① 本地（网络正常）构建 linux/amd64 镜像
+docker buildx build --platform linux/amd64 -t market-anomaly-monitor:latest -f deployment/Dockerfile .
+
+# ② 压缩后传到服务器并导入（约 200-400MB）
+docker save market-anomaly-monitor:latest | gzip -1 | ssh root@<服务器IP> 'gunzip | docker load'
+
+# ③ 服务器上只启动，不再构建
+cd deployment && docker compose up -d --no-build
+```
+
+**其他构建错误**：
 
 | 错误现象 | 可能原因 | 解决方法 |
 |----------|----------|----------|
-| `npm install` 超时 | 网络问题 | 配置 npm 镜像源，或使用 `--network=host` 构建 |
+| `RUN --mount` 报语法错误 | Docker 过旧（< 23）/未启用 BuildKit | 升级 Docker 到 23+，或安装 buildx 后 `DOCKER_BUILDKIT=1` |
 | `node-gyp` 编译失败 | 缺少编译工具 | Dockerfile 已包含 python3/make/g++ |
-| 构建速度慢 | 缓存未命中 | 确保 package.json 不变时复用缓存层 |
+| 构建上下文异常大（几百 MB） | `.dockerignore` 失效 | 确保仓库**根目录**存在 `.dockerignore`（放在 `deployment/` 下不会被读取） |
 
 ### 5. 行情数据不更新
 
@@ -326,6 +505,22 @@ docker compose logs app
 - 前端构建失败，静态资源未生成
 - 路由路径与部署前缀不匹配
 
+**自建部署必查项（本仓库代码已适配，回退代码时注意）**：
+
+1. **首页白屏、`/assets/*.js` 返回的是 HTML**：
+   核心包 `configureApp()` 的静态中间件会跳过 `assets/` 前缀（平台部署时 hashed 产物走 CDN）。
+   自建部署没有 CDN，`server/main.ts` 中追加的 `app.useStaticAssets(..., { index: false })`
+   负责同源直出 `dist/client`，删除它会白屏。
+2. **容器启动即退出，日志报 `Nest could not find AppLogger element`**：
+   `configureApp()` 内部执行 `app.useLogger(app.get(AppLogger))`，该 provider 由
+   `@lark-apaas/nestjs-logger` 的 `LoggerModule` 提供，必须出现在 `server/app.module.ts`
+   的 `imports` 中。
+3. **首页 500（`Failed to lookup view "index"`）**：
+   视图目录固定为 `<cwd>/dist/client`，镜像内 cwd 为 `/app`，
+   因此 `dist/client/index.html` 必须存在。Dockerfile 在构建后会做一次位置规范化
+   （自建构建产物可能落在 `dist/client/client/index.html`）。
+4. **宿主机访问不到 3000 端口**：确认 `SERVER_HOST=0.0.0.0`（见环境变量表）。
+
 ---
 
 ## 升级部署
@@ -352,6 +547,7 @@ curl http://localhost:3000/api/health
 
 ```
 项目根目录/
+├── .dockerignore            # ⚠️ Docker 构建忽略规则（必须在上下文根目录，即仓库根）
 ├── client/                  # 前端源码 (React + Vite)
 ├── server/                  # 后端源码 (NestJS)
 │   └── modules/health/      # 健康检查模块
@@ -359,7 +555,6 @@ curl http://localhost:3000/api/health
 ├── dist/                    # 构建输出目录
 └── deployment/              # 部署相关文件
     ├── Dockerfile           # Docker 镜像构建（多阶段构建）
-    ├── .dockerignore        # Docker 构建忽略规则
     ├── .env.example         # 环境变量示例
     ├── docker-compose.yml   # Docker Compose 编排配置
     ├── deploy.sh            # 一键部署脚本

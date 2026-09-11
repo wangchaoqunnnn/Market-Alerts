@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # ============================================
   # 主应用服务
@@ -9,6 +7,11 @@ services:
     build:
       context: ..
       dockerfile: deployment/Dockerfile
+      args:
+        # npm 镜像源：国内服务器可换成云厂商内网源（免流量、更稳），例如
+        #   NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/ ./deploy.sh build
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        NPM_FALLBACK_REGISTRY: ${NPM_FALLBACK_REGISTRY:-https://registry.npmjs.org}
     container_name: market-anomaly-monitor
     restart: unless-stopped
     ports:
@@ -17,6 +20,12 @@ services:
       - .env
     environment:
       - NODE_ENV=production
+      # 必须监听 0.0.0.0：代码默认 localhost 只绑定 127.0.0.1，
+      # 容器外（宿主机/浏览器）将无法访问映射出去的 3000 端口
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=3000
+      # 日志目录（应用写 <LOG_DIR>/server.log），容器内默认 /app/logs
+      - LOG_DIR=/app/logs
     depends_on:
       db:
         condition: service_healthy
@@ -46,7 +55,9 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      # 仅绑定本机回环，避免数据库端口暴露到公网（宿主机 psql/pg_dump 仍可用）
+      # 如需局域网直连，改成 "5432:5432"
+      - "127.0.0.1:5432:5432"
     networks:
       - app-network
     healthcheck:

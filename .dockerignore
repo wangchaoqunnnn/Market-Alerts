@@ -1,0 +1,71 @@
+# ============================================
+# Docker 构建上下文忽略规则
+#
+# ⚠️ 本文件必须位于「构建上下文根目录」（docker-compose.yml 中 context: ..），
+#    放在 deployment/ 下的 .dockerignore 不会被 Docker 读取（已验证）。
+#    历史文件 deployment/.dockerignore 已删除。
+#
+# 作用：
+#   1. 不把 node_modules / dist 等本地产物传给 Docker（本地构建时上下文可从 650MB 降到 ~2MB）；
+#   2. 不把 .env 等密钥传入构建上下文；
+#   3. 保证镜像里用的是容器内重新安装/编译的产物，而不是宿主机残留文件。
+#
+# ⚠️ 不要在此忽略构建真正需要的文件：
+#    package.json / package-lock.json / client / server / shared /
+#    nest-cli.json / tsconfig*.json / vite.config.ts / tailwind.config.ts / postcss.config.js
+# ============================================
+
+# 依赖与构建产物
+node_modules
+**/node_modules
+dist
+**/dist
+build
+**/build
+coverage
+
+# 版本控制与 Git 钩子
+.git
+.gitignore
+.githooks
+
+# 环境变量（密钥），compose 通过 env_file 注入，不进入构建上下文
+.env
+.env.*
+!.env.example
+
+# 日志与运行时数据
+logs
+*.log
+pids
+*.pid
+
+# 文档与临时工作目录
+*.md
+docs
+需求
+draft_53aba688_folder
+tmp
+temp
+*.tmp
+
+# Agent / 工具状态
+.agent
+.agent-memory
+.spark
+.spark_project
+.playwright-cli
+
+# 编辑器与系统文件
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# 缓存
+.eslintcache
+*.tsbuildinfo
+.swc
