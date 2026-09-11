@@ -34,7 +34,7 @@ export class ScreenStrategiesService {
         createdAt: screenStrategies.createdAt,
       })
       .from(screenStrategies)
-      .where(sql`(${screenStrategies.createdBy}).user_id = ${userId}`)
+      .where(sql`${screenStrategies.createdBy} = ${userId}`)
       .orderBy(desc(screenStrategies.createdAt));
 
     return rows.map((row) => ({
@@ -121,7 +121,7 @@ export class ScreenStrategiesService {
       .update(screenStrategies)
       .set(patch)
       .where(
-        sql`${screenStrategies.id} = ${id}::uuid AND (${screenStrategies.createdBy}).user_id = ${userId}`,
+        sql`${screenStrategies.id} = ${id}::uuid AND ${screenStrategies.createdBy} = ${userId}`,
       )
       .returning({
         id: screenStrategies.id,
@@ -151,7 +151,7 @@ export class ScreenStrategiesService {
     const result = await this.db
       .delete(screenStrategies)
       .where(
-        sql`${screenStrategies.id} = ${id}::uuid AND (${screenStrategies.createdBy}).user_id = ${userId}`,
+        sql`${screenStrategies.id} = ${id}::uuid AND ${screenStrategies.createdBy} = ${userId}`,
       )
       .returning({ id: screenStrategies.id });
 

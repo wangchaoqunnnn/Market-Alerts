@@ -1,8 +1,8 @@
 import { APP_FILTER } from '@nestjs/core';
 import { Module } from '@nestjs/common';
-import { PlatformModule } from '@lark-apaas/fullstack-nestjs-core';
 
 import { GlobalExceptionFilter } from './common/filters/exception.filter';
+import { DatabaseModule } from './database/database.module';
 import { ViewModule } from './modules/view/view.module';
 import { MarketDataModule } from './modules/market-data/market-data.module';
 import { HealthModule } from './modules/health/health.module';
@@ -13,8 +13,8 @@ import { ReportHistoryModule } from './modules/report-history/report-history.mod
 
 @Module({
   imports: [
-    // 平台 Module，提供平台能力
-    PlatformModule.forRoot(),
+    // 独立部署数据库模块：提供 DRIZZLE_DATABASE 连接 + 自动建表
+    DatabaseModule,
     // ====== @route-section: business-modules START ======
     // Place all business modules here.Do NOT add fallback modules here.
     MarketDataModule,

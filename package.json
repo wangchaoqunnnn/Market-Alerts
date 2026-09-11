@@ -25,7 +25,7 @@
     "type:check:server": "tsc --noEmit --project tsconfig.node.json",
     "lint": "node ./scripts/lint.js",
     "precommit": "node scripts/hooks/run-precommit.js",
-    "prepare": "chmod +x .githooks/pre-commit 2>/dev/null; git config core.hooksPath .githooks 2>/dev/null || true"
+    "prepare": "node -e \"try{require('fs').chmodSync('.githooks/pre-commit',0o755)}catch(e){};try{require('child_process').execSync('git config core.hooksPath .githooks')}catch(e){}\""
   },
   "dependencies": {
     "@lark-apaas/fullstack-nestjs-core": "^1.1.61",
@@ -47,6 +47,7 @@
     "dotenv": "^17.2.2",
     "drizzle-orm": "0.44.6",
     "hbs": "^4.2.0",
+    "postgres": "^3.4.5",
     "reflect-metadata": "^0.1.14",
     "tslib": "^2.8.1"
   },

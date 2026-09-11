@@ -49,7 +49,7 @@ export class WatchlistService {
         createdAt: watchlistStocks.createdAt,
       })
       .from(watchlistStocks)
-      .where(sql`(${watchlistStocks.createdBy}).user_id = ${userId}`)
+      .where(sql`${watchlistStocks.createdBy} = ${userId}`)
       .orderBy(watchlistStocks.createdAt);
 
     return rows.map((row) => ({
@@ -116,7 +116,7 @@ export class WatchlistService {
     const result = await this.db
       .delete(watchlistStocks)
       .where(
-        sql`${watchlistStocks.id} = ${id}::uuid AND (${watchlistStocks.createdBy}).user_id = ${userId}`,
+        sql`${watchlistStocks.id} = ${id}::uuid AND ${watchlistStocks.createdBy} = ${userId}`,
       )
       .returning({ id: watchlistStocks.id });
 
@@ -141,7 +141,7 @@ export class WatchlistService {
       .update(watchlistStocks)
       .set(patch)
       .where(
-        sql`${watchlistStocks.id} = ${id}::uuid AND (${watchlistStocks.createdBy}).user_id = ${userId}`,
+        sql`${watchlistStocks.id} = ${id}::uuid AND ${watchlistStocks.createdBy} = ${userId}`,
       )
       .returning({
         id: watchlistStocks.id,

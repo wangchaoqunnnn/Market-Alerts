@@ -38,7 +38,7 @@ export class ReportHistoryService {
     const pageSizeNum = Math.min(Math.max(1, pageSize), 100);
     const offset = (pageNum - 1) * pageSizeNum;
 
-    const whereCondition = sql`(${reportHistory.createdBy}).user_id = ${userId}`;
+    const whereCondition = sql`${reportHistory.createdBy} = ${userId}`;
     const typeCondition = type && this.isValidReportType(type)
       ? sql` AND ${reportHistory.reportType} = ${type}`
       : sql``;
@@ -94,7 +94,7 @@ export class ReportHistoryService {
       })
       .from(reportHistory)
       .where(
-        sql`${reportHistory.id} = ${id}::uuid AND (${reportHistory.createdBy}).user_id = ${userId}`,
+        sql`${reportHistory.id} = ${id}::uuid AND ${reportHistory.createdBy} = ${userId}`,
       );
 
     if (rows.length === 0) {
@@ -163,7 +163,7 @@ export class ReportHistoryService {
     const result = await this.db
       .delete(reportHistory)
       .where(
-        sql`${reportHistory.id} = ${id}::uuid AND (${reportHistory.createdBy}).user_id = ${userId}`,
+        sql`${reportHistory.id} = ${id}::uuid AND ${reportHistory.createdBy} = ${userId}`,
       )
       .returning({ id: reportHistory.id });
 

@@ -60,7 +60,7 @@ export class AlertSettingsService {
         createdAt: alertSettings.createdAt,
       })
       .from(alertSettings)
-      .where(sql`(${alertSettings.createdBy}).user_id = ${userId}`);
+      .where(sql`${alertSettings.createdBy} = ${userId}`);
 
     const existingMap = new Map<string, typeof rows[0]>();
     for (const row of rows) {
@@ -105,7 +105,7 @@ export class AlertSettingsService {
       })
       .from(alertSettings)
       .where(
-        sql`(${alertSettings.createdBy}).user_id = ${userId} AND ${alertSettings.alertType} = ${type}`,
+        sql`${alertSettings.createdBy} = ${userId} AND ${alertSettings.alertType} = ${type}`,
       );
 
     if (rows.length === 0) {
@@ -143,7 +143,7 @@ export class AlertSettingsService {
       .select({ id: alertSettings.id })
       .from(alertSettings)
       .where(
-        sql`(${alertSettings.createdBy}).user_id = ${userId} AND ${alertSettings.alertType} = ${type}`,
+        sql`${alertSettings.createdBy} = ${userId} AND ${alertSettings.alertType} = ${type}`,
       );
 
     let resultRow: {
@@ -226,7 +226,7 @@ export class AlertSettingsService {
       })
       .from(alertSettings)
       .where(
-        sql`(${alertSettings.createdBy}).user_id = ${userId} AND ${alertSettings.alertType} = ${type}`,
+        sql`${alertSettings.createdBy} = ${userId} AND ${alertSettings.alertType} = ${type}`,
       );
 
     if (rows.length === 0) {

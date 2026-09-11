@@ -27,19 +27,22 @@ export const customTimestamptz = customType<{
   },
 });
 
+/**
+ * 用户标识字段
+ * 独立部署版：由平台复合类型 user_profile 简化为标准 text，存用户 ID 字符串
+ */
 export const userProfile = customType<{
   data: string;
   driverData: string;
 }>({
   dataType() {
-    return 'user_profile';
+    return 'text';
   },
   toDriver(value: string) {
-    return sql`ROW(${value})::user_profile`;
+    return value;
   },
   fromDriver(value: string) {
-    const [userId] = value.slice(1, -1).split(',');
-    return userId.trim();
+    return value;
   },
 });
 
@@ -128,13 +131,11 @@ export const alertSettings = pgTable("alert_settings", {
   // System field: Creation time (auto-filled, do not modify)
   createdAt: customTimestamptz("_created_at", { precision: 3 }).notNull().default(sql`CURRENT_TIMESTAMP`),
   // System field: Creator (auto-filled, do not modify)
-  createdBy: userProfile("_created_by").default(sql`CASE
-    WHEN (current_setting('app.user_id'::text, true) = ''::text) THEN NULL`),
+  createdBy: userProfile("_created_by"),
   // System field: Update time (auto-filled, do not modify)
   updatedAt: customTimestamptz("_updated_at", { precision: 3 }).notNull().default(sql`CURRENT_TIMESTAMP`),
   // System field: Updater (auto-filled, do not modify)
-  updatedBy: userProfile("_updated_by").default(sql`CASE
-    WHEN (current_setting('app.user_id'::text, true) = ''::text) THEN NULL`),
+  updatedBy: userProfile("_updated_by"),
 }, (table) => [
   // Complex index: CREATE UNIQUE INDEX idx_alert_settings_user_type ON alert_settings USING btree (((_created_by).user_id), alert_type),
 ]);
@@ -151,13 +152,11 @@ export const reportHistory = pgTable("report_history", {
   // System field: Creation time (auto-filled, do not modify)
   createdAt: customTimestamptz("_created_at", { precision: 3 }).notNull().default(sql`CURRENT_TIMESTAMP`),
   // System field: Creator (auto-filled, do not modify)
-  createdBy: userProfile("_created_by").default(sql`CASE
-    WHEN (current_setting('app.user_id'::text, true) = ''::text) THEN NULL`),
+  createdBy: userProfile("_created_by"),
   // System field: Update time (auto-filled, do not modify)
   updatedAt: customTimestamptz("_updated_at", { precision: 3 }).notNull().default(sql`CURRENT_TIMESTAMP`),
   // System field: Updater (auto-filled, do not modify)
-  updatedBy: userProfile("_updated_by").default(sql`CASE
-    WHEN (current_setting('app.user_id'::text, true) = ''::text) THEN NULL`),
+  updatedBy: userProfile("_updated_by"),
 });
 
 export const screenStrategies = pgTable("screen_strategies", {
@@ -172,13 +171,11 @@ export const screenStrategies = pgTable("screen_strategies", {
   // System field: Creation time (auto-filled, do not modify)
   createdAt: customTimestamptz("_created_at", { precision: 3 }).notNull().default(sql`CURRENT_TIMESTAMP`),
   // System field: Creator (auto-filled, do not modify)
-  createdBy: userProfile("_created_by").default(sql`CASE
-    WHEN (current_setting('app.user_id'::text, true) = ''::text) THEN NULL`),
+  createdBy: userProfile("_created_by"),
   // System field: Update time (auto-filled, do not modify)
   updatedAt: customTimestamptz("_updated_at", { precision: 3 }).notNull().default(sql`CURRENT_TIMESTAMP`),
   // System field: Updater (auto-filled, do not modify)
-  updatedBy: userProfile("_updated_by").default(sql`CASE
-    WHEN (current_setting('app.user_id'::text, true) = ''::text) THEN NULL`),
+  updatedBy: userProfile("_updated_by"),
 });
 
 export const watchlistStocks = pgTable("watchlist_stocks", {
@@ -190,13 +187,11 @@ export const watchlistStocks = pgTable("watchlist_stocks", {
   // System field: Creation time (auto-filled, do not modify)
   createdAt: customTimestamptz("_created_at", { precision: 3 }).notNull().default(sql`CURRENT_TIMESTAMP`),
   // System field: Creator (auto-filled, do not modify)
-  createdBy: userProfile("_created_by").default(sql`CASE
-    WHEN (current_setting('app.user_id'::text, true) = ''::text) THEN NULL`),
+  createdBy: userProfile("_created_by"),
   // System field: Update time (auto-filled, do not modify)
   updatedAt: customTimestamptz("_updated_at", { precision: 3 }).notNull().default(sql`CURRENT_TIMESTAMP`),
   // System field: Updater (auto-filled, do not modify)
-  updatedBy: userProfile("_updated_by").default(sql`CASE
-    WHEN (current_setting('app.user_id'::text, true) = ''::text) THEN NULL`),
+  updatedBy: userProfile("_updated_by"),
 }, (table) => [
   // Complex index: CREATE UNIQUE INDEX idx_watchlist_stocks_user_code ON watchlist_stocks USING btree (((_created_by).user_id), stock_code),
 ]);
