@@ -6,6 +6,11 @@ FROM node:22-alpine AS builder
 
 # 国内镜像源加速（容器内 npm install 默认走官方源，国内服务器极慢）
 ENV npm_config_registry=https://registry.npmmirror.com
+# npm 网络健壮性：重试 5 次、单次超时 10 分钟、退避 20s-120s（镜像站偶发限流/超时）
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_timeout=600000 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000
 
 WORKDIR /app
 
@@ -43,6 +48,11 @@ FROM node:22-alpine AS production
 
 # 国内镜像源加速
 ENV npm_config_registry=https://registry.npmmirror.com
+# npm 网络健壮性：重试 5 次、单次超时 10 分钟、退避 20s-120s
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_timeout=600000 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000
 
 WORKDIR /app
 
