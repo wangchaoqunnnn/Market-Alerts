@@ -388,6 +388,35 @@ POSTGRES_IMAGE=docker.m.daocloud.io/library/postgres:16-alpine
 
 ### 2. npm 依赖（1500+ 个包、约 400MB，构建耗时大头）
 
+**直接在服务器上改 `deployment/.env`（改完必须重新构建，不是重启）：**
+
+```bash
+cd /opt/market-alerts/deployment
+
+# ① npm 走云厂商内网源（按你的云厂商二选一）
+sed -i 's#^NPM_REGISTRY=.*#NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/#' .env   # 腾讯云 CVM
+# sed -i 's#^NPM_REGISTRY=.*#NPM_REGISTRY=https://repo.huaweicloud.com/repository/npm/#' .env  # 华为云
+# sed -i 's#^NPM_REGISTRY=.*#NPM_REGISTRY=https://mirrors.cloud.aliyuncs.com/npm/#' .env       # 阿里云 ECS（内网免流量）
+
+# ② 内网源链路稳定，并发提到 24 提速（公网源请保持 6，否则会被限流）
+sed -i 's#^NPM_MAXSOCKETS=.*#NPM_MAXSOCKETS=24#' .env
+
+# ③ 基础镜像走国内仓库（拉 Docker Hub 慢时）
+sed -i 's#^NODE_IMAGE=.*#NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine#' .env
+sed -i 's#^POSTGRES_IMAGE=.*#POSTGRES_IMAGE=docker.m.daocloud.io/library/postgres:16-alpine#' .env
+
+# 确认写入结果
+grep -E '^(NPM_|NODE_IMAGE|POSTGRES_IMAGE)' .env
+
+# 重新构建（构建参数变化不会自动重建，必须显式 build）
+./deploy.sh build
+```
+
+> 这些变量由 `docker-compose.yml` 的 `build.args` 读取（`${NPM_REGISTRY:-默认值}`），
+> 因此**只影响构建**；改完不 `build` 是不生效的。
+> 命令行环境变量优先级高于 `.env`：`NPM_MAXSOCKETS=32 ./deploy.sh build` 会覆盖文件里的值。
+> 写法要求：**不要加引号**、`=` 两侧不要空格、`NPM_MAXSOCKETS` 写纯数字。
+
 | 手段 | 做法 |
 |------|------|
 | 换云厂商内网源 | `.env`：`NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/`（腾讯）/ `https://repo.huaweicloud.com/repository/npm/`（华为）/ `https://mirrors.cloud.aliyuncs.com/npm/`（阿里 ECS 内网，免流量） |
@@ -397,6 +426,7 @@ POSTGRES_IMAGE=docker.m.daocloud.io/library/postgres:16-alpine
 
 > 实测参考：本机约 0.6MB/s 链路上，各公共 npm 镜像速度相近（瓶颈在带宽而非镜像源本身）；
 > 云厂商内网源通常 10MB/s 以上，是提速最明显的一项。
+> 验证是否生效：`docker compose config | grep -E 'NPM_|NODE_IMAGE'` 会显示实际传给构建的值。
 
 ### 3. 已内置的其他优化（无需配置）
 
