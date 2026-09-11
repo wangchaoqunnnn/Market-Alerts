@@ -1,0 +1,53 @@
+/* 炸板监控页面自定义样式 */
+
+/* 表格列布局 - 14列 */
+.grid-cols-table-header {
+  grid-template-columns:
+    minmax(140px, 1.3fr)    /* 代码/名称 */
+    minmax(90px, 0.8fr)     /* 最新/涨停 */
+    minmax(80px, 0.7fr)     /* 距涨停 */
+    minmax(80px, 0.7fr)     /* 涨跌幅 */
+    minmax(70px, 0.6fr)     /* 炸板次数 */
+    minmax(70px, 0.6fr)     /* 状态 */
+    minmax(80px, 0.7fr)     /* 首次封板 */
+    minmax(80px, 0.7fr)     /* 首次炸板 */
+    minmax(80px, 0.7fr)     /* 最后炸板 */
+    minmax(90px, 0.7fr)     /* 炸板前封单 */
+    minmax(80px, 0.7fr)     /* 成交额 */
+    minmax(70px, 0.6fr)     /* 换手率 */
+    minmax(100px, 0.8fr);   /* 行业 */
+}
+
+/* 新炸板闪烁动画 */
+@keyframes flash-red {
+  0% {
+    background-color: rgba(248, 81, 73, 0.35);
+  }
+  30% {
+    background-color: rgba(248, 81, 73, 0.15);
+  }
+  60% {
+    background-color: rgba(248, 81, 73, 0.25);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.animate-flash-red {
+  animation: flash-red 1.5s ease-out;
+}
+
+/* 缓慢旋转 - 用于刷新图标 */
+@keyframes spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin-slow {
+  animation: spin-slow 3s linear infinite;
+}
