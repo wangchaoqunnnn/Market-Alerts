@@ -13,6 +13,9 @@ RUN apk add --no-cache python3 make g++
 # 只要 package.json 不变，这一层就不会重建
 COPY package.json package-lock.json* ./
 
+# 移除模板脚手架残留的 postinstall 钩子（fullstack-cli 在容器内不存在，会导致 npm install 失败）
+RUN npm pkg delete scripts.postinstall || true
+
 # 安装所有依赖（含 devDependencies，用于构建）
 RUN npm install --production=false
 
@@ -46,6 +49,9 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 # 先复制包管理文件（缓存层）
 COPY package.json package-lock.json* ./
+
+# 移除 postinstall 钩子，避免 fullstack-cli 不存在导致安装失败
+RUN npm pkg delete scripts.postinstall || true
 
 # 仅安装生产依赖，并清理 npm 缓存减小镜像体积
 RUN npm install --production=true && npm cache clean --force
