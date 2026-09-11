@@ -4,6 +4,9 @@
 # ============================================
 FROM node:22-alpine AS builder
 
+# 国内镜像源加速（容器内 npm install 默认走官方源，国内服务器极慢）
+ENV npm_config_registry=https://registry.npmmirror.com
+
 WORKDIR /app
 
 # 安装构建所需的系统依赖（部分 native 包需要编译）
@@ -37,6 +40,9 @@ RUN npm run build:prod
 # 运行阶段：仅保留生产依赖和编译产物
 # ============================================
 FROM node:22-alpine AS production
+
+# 国内镜像源加速
+ENV npm_config_registry=https://registry.npmmirror.com
 
 WORKDIR /app
 
