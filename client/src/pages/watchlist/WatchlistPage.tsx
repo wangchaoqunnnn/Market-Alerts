@@ -14,6 +14,7 @@ import { useNavigate } from 'react-router-dom';
 import { logger } from '@lark-apaas/client-toolkit/logger';
 import { watchlistApi, marketDataApi } from '@client/src/api';
 import type { WatchlistStock, StockQuote, StockBase } from '@shared/api.interface';
+import { boardFullLabel } from '@shared/a-share';
 import { formatPrice, formatPercent, getPriceColorClass } from '@client/src/utils/format';
 import { Button } from '@client/src/components/ui/button';
 import { Input } from '@client/src/components/ui/input';
@@ -575,7 +576,7 @@ const WatchlistPage = () => {
                         </div>
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] text-text-muted">
-                            {stock.board === 'gem' ? '创业板' : stock.board === 'star' ? '科创板' : stock.board === 'bj' ? '北交所' : '主板'}
+                            {boardFullLabel(stock.market, stock.board)}
                           </span>
                           {stock.isST && (
                             <span className="text-[10px] px-1.5 py-0.5 bg-warning/20 text-warning rounded">ST</span>

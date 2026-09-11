@@ -18,8 +18,32 @@ import type {
   ListResponse,
   LimitBrokenSectorStat,
   MarketStatus,
+  MarketCoverage,
+  BoardCoverage,
 } from '@shared/api.interface.ts';
-import { generateMockStocks, INDUSTRIES, type MockStock } from './mock-stocks';
+import {
+  BOARD_ORDER,
+  MARKET_LABELS,
+  boardFullLabel,
+  classifyAShareCode,
+  getPriceLimit,
+  normalizeStockCode,
+  type Board,
+  type Market,
+} from '@shared/a-share';
+import {
+  generateMockStocks,
+  buildMockStockForCode,
+  INDUSTRIES,
+  type MockStock,
+  type StockMeta,
+} from './mock-stocks';
+import {
+  RealMarketDataProvider,
+  type DataSourceKind,
+  type PoolItem,
+  type RealQuote,
+} from './real-market.provider';
 
 interface RuntimeQuote {
   stock: MockStock;
@@ -50,11 +74,22 @@ interface RuntimeQuote {
   timestamp: number;
   momentumPhase: 'none' | 'surging' | 'plunging';
   momentumRemaining: number;
+  /** 东财 5 分钟涨速（真实数据源）：本地分钟样本不足时用于涨速榜兜底 */
+  realSpeed: number;
+  /** 真实行情提供的换手率（%） */
+  realTurnover: number;
+  /** 真实行情提供的总市值/流通市值（元） */
+  realMarketCap: number;
+  realFloatMarketCap: number;
+  /** 最近一次由真实行情刷新的时间戳（0 表示纯模拟数据） */
+  lastRealUpdate: number;
 }
 
 const PRICE_PRECISION: number = 2;
 const MINUTE_MS: number = 60 * 1000;
 const HISTORY_MINUTES: number = 10;
+/** 按需纳入监控的股票数上限（真实 A 股约 5400 只，留足余量并防止异常请求撑爆内存） */
+const MAX_UNIVERSE_SIZE: number = 8000;
 
 function roundPrice(value: number): number {
   return Math.round(value * Math.pow(10, PRICE_PRECISION)) / Math.pow(10, PRICE_PRECISION);
@@ -73,60 +108,388 @@ export class MarketDataService implements OnModuleInit {
   private tickInterval: ReturnType<typeof setInterval> | null = null;
   private startTime: number = 0;
 
-  onModuleInit(): void {
-    this.logger.log('初始化行情数据服务...');
-    this.initStocks();
-    this.startTick();
-    this.logger.log(`行情服务已启动，共 ${this.quotes.size} 只股票`);
+  // ===== 真实行情相关状态 =====
+  private readonly provider: RealMarketDataProvider = new RealMarketDataProvider();
+  /** 当前生效的数据源：eastmoney / tencent / sina / mock */
+  private dataSource: DataSourceKind = 'mock';
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private refreshing: boolean = false;
+  private universeLoading: boolean = false;
+  private lastFullSnapshotAt: number = 0;
+  private universeLoaded: boolean = false;
+  /** 已按需加载的真实财务/概念数据缓存 */
+  private enrichmentCache: Map<string, { roe: number; revenue: number; netProfit: number; grossMargin: number; concepts: string[]; bars: { date: string; close: number }[] }> = new Map();
+
+  /** 行情刷新间隔（真实数据源，默认 5 秒；模拟数据源为 1 秒） */
+  private get refreshIntervalMs(): number {
+    const value: number = Number(process.env.REFRESH_INTERVAL_MS);
+    return Number.isFinite(value) && value >= 1000 ? value : 5000;
   }
 
-  private initStocks(): void {
+  /** 全市场快照刷新间隔（默认 60 秒，避免频繁分页拉取 60 页） */
+  private get fullSnapshotIntervalMs(): number {
+    const value: number = Number(process.env.FULL_SNAPSHOT_INTERVAL_MS);
+    return Number.isFinite(value) && value >= 10000 ? value : 60000;
+  }
+
+  /** 股票池上限（默认 8000，真实全 A 约 5900 只） */
+  private get universeLimit(): number {
+    const value: number = Number(process.env.MAX_STOCKS);
+    return Number.isFinite(value) && value >= 100 ? value : MAX_UNIVERSE_SIZE;
+  }
+
+  async onModuleInit(): Promise<void> {
+    this.logger.log('初始化行情数据服务...');
+    this.startTime = Date.now();
+
+    const preferred: string = (process.env.MARKET_DATA_SOURCE ?? 'auto').toLowerCase();
+    if (preferred !== 'mock') {
+      const ready: boolean = await this.initRealData(preferred);
+      if (ready) return;
+      this.logger.warn('真实行情源全部不可用，回退到模拟数据引擎（仅用于演示）');
+    }
+    this.initMockData();
+  }
+
+  // ==========================================================
+  // 真实行情：初始化（先拉涨停/炸板池让页面立刻有数据，全市场列表后台加载）
+  // ==========================================================
+  private async initRealData(preferred: string): Promise<boolean> {
+    const source: DataSourceKind = this.resolveSource(preferred);
+    this.dataSource = source;
+    this.logger.log(`行情数据源：${source}（真实行情）`);
+
+    // 先拉涨停/炸板池：一是让页面立刻有数据，二是用它快速判断数据源是否可用
+    const poolsReady: boolean = await this.refreshPools();
+    if (!poolsReady) {
+      const probe: RealQuote[] = await this.provider.fetchQuotes(['600519']);
+      if (!probe.length) {
+        return false;
+      }
+      this.logger.warn('涨停/炸板池暂不可用（可能休市），全市场行情源正常，继续以真实行情运行');
+      for (const quote of probe) this.applyRealQuote(quote);
+    }
+
+    // 全市场约 5900 只、东财每页上限 100 条，后台分页加载，不阻塞服务启动
+    void this.loadUniverse();
+    this.startRealRefresh();
+    return true;
+  }
+
+  /** 加载（或刷新）全市场真实行情快照 */
+  private async loadUniverse(): Promise<void> {
+    if (this.universeLoading) return;
+    this.universeLoading = true;
+    try {
+      const universe: RealQuote[] = await this.provider.fetchAllStocks(this.universeLimit, (msg: string): void => {
+        this.logger.log(msg);
+      });
+      if (!universe.length) {
+        this.logger.error('全市场行情列表拉取失败，稍后自动重试');
+        return;
+      }
+      for (const quote of universe) {
+        this.applyRealQuote(quote);
+      }
+      this.universeLoaded = true;
+      this.lastFullSnapshotAt = Date.now();
+      this.logger.log(`真实行情已就绪，共 ${this.quotes.size} 只股票`);
+      this.logMarketCoverage();
+    } finally {
+      this.universeLoading = false;
+    }
+  }
+
+  private resolveSource(preferred: string): DataSourceKind {
+    if (preferred === 'tencent') return 'tencent';
+    if (preferred === 'sina') return 'sina';
+    if (preferred === 'eastmoney') return 'eastmoney';
+    // auto / 其它值：以东财为主源（内部会自动在 push2 与 push2delay 间切换）
+    return 'eastmoney';
+  }
+
+  private startRealRefresh(): void {
+    if (this.refreshTimer) return;
+    this.refreshTimer = setInterval((): void => {
+      void this.refreshRealData();
+    }, this.refreshIntervalMs);
+    this.logger.log(`行情刷新已启动，间隔 ${this.refreshIntervalMs}ms（全市场快照每 ${this.fullSnapshotIntervalMs}ms）`);
+  }
+
+  private async refreshRealData(): Promise<void> {
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      await this.refreshPools();
+      if (Date.now() - this.lastFullSnapshotAt >= this.fullSnapshotIntervalMs) {
+        await this.loadUniverse();
+      }
+      this.recordMinuteSnap(Date.now());
+    } catch (error) {
+      this.logger.warn(`行情刷新失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  /** 刷新涨停池 / 炸板池（真实封单额、首末封板时间、连板数、炸板次数） */
+  private async refreshPools(): Promise<boolean> {
+    const [limitUpPool, brokenPool] = await Promise.all([
+      this.provider.fetchLimitUpPool(),
+      this.provider.fetchBrokenPool(),
+    ]);
+    if (!limitUpPool.length && !brokenPool.length) return false;
+
+    // 池子是全量快照，先清空再重建，避免旧的涨停状态残留
+    const now: number = Date.now();
+    for (const q of this.quotes.values()) {
+      q.isLimitUp = false;
+      q.status = 'normal';
+      q.openCount = 0;
+      q.stock.consecutiveDays = 0;
+    }
+
+    for (const item of limitUpPool) {
+      this.applyLimitUpPoolItem(item, now);
+    }
+    for (const item of brokenPool) {
+      this.applyBrokenPoolItem(item, now);
+    }
+    this.refreshPoolUniverse(limitUpPool, brokenPool);
+    return true;
+  }
+
+  /** 涨停池里可能有尚未进入股票池的股票（列表尚未加载完或已剔除），按需补入 */
+  private refreshPoolUniverse(limitUpPool: PoolItem[], brokenPool: PoolItem[]): void {
+    for (const item of [...limitUpPool, ...brokenPool]) {
+      if (this.quotes.has(item.code)) continue;
+      const meta: StockMeta = {
+        code: item.code,
+        name: item.name,
+        market: item.market,
+        board: item.board,
+        isST: item.name.includes('ST'),
+        isNew: false,
+        limitUpPercent: getPriceLimit(item.board, item.name.includes('ST')).limitUpPercent,
+        limitDownPercent: getPriceLimit(item.board, item.name.includes('ST')).limitDownPercent,
+        industry: item.industry,
+        concept: [item.industry],
+        basePrice: item.price,
+        marketCap: item.floatMarketCap,
+        floatMarketCap: item.floatMarketCap,
+        pe: 0,
+        pb: 0,
+        totalShares: 0,
+        floatShares: 0,
+        roe: 0,
+        revenue: 0,
+        netProfit: 0,
+        grossMargin: 0,
+        consecutiveDays: item.consecutiveDays,
+      };
+      const quote: RuntimeQuote = this.createQuote(meta, Date.now());
+      quote.isLimitUp = true;
+      this.quotes.set(item.code, quote);
+    }
+  }
+
+  private applyLimitUpPoolItem(item: PoolItem, now: number): void {
+    const q: RuntimeQuote | undefined = this.quotes.get(item.code);
+    if (!q) return;
+    q.isLimitUp = true;
+    q.isLimitDown = false;
+    q.status = item.breakCount > 0 ? 'resealed' : 'sealing';
+    q.price = item.price || q.price;
+    q.high = Math.max(q.high, item.price);
+    q.sealAmount = item.sealAmount;
+    q.openCount = item.breakCount;
+    q.stock.consecutiveDays = item.consecutiveDays;
+    q.stock.industry = item.industry || q.stock.industry;
+    q.firstSealTime = this.timeToday(item.firstSealTime, now) ?? q.firstSealTime;
+    q.lastSealTime = this.timeToday(item.lastSealTime || item.firstSealTime, now) ?? q.lastSealTime;
+    q.timeline = this.buildPoolTimeline(item, q);
+    q.timestamp = now;
+  }
+
+  private applyBrokenPoolItem(item: PoolItem, now: number): void {
+    const q: RuntimeQuote | undefined = this.quotes.get(item.code);
+    if (!q) return;
+    q.isLimitUp = false;
+    q.status = 'broken';
+    q.openCount = item.breakCount;
+    q.price = item.price || q.price;
+    q.stock.consecutiveDays = item.consecutiveDays;
+    q.stock.industry = item.industry || q.stock.industry;
+    q.firstSealTime = this.timeToday(item.firstSealTime, now) ?? q.firstSealTime;
+    q.lastBreakTime = now;
+    q.timeline = this.buildPoolTimeline(item, q);
+    q.timestamp = now;
+  }
+
+  private buildPoolTimeline(item: PoolItem, q: RuntimeQuote): SealEvent[] {
+    const timeline: SealEvent[] = [];
+    if (item.firstSealTime) {
+      timeline.push({ time: item.firstSealTime, type: 'seal', price: item.limitUpPrice || q.price, sealAmount: item.sealAmount });
+    }
+    for (let i: number = 0; i < item.breakCount; i += 1) {
+      timeline.push({ time: item.lastSealTime || item.firstSealTime, type: 'break', price: q.price });
+    }
+    if (item.lastSealTime && item.breakCount > 0) {
+      timeline.push({ time: item.lastSealTime, type: 'reseal', price: item.limitUpPrice || q.price, sealAmount: item.sealAmount });
+    }
+    return timeline;
+  }
+
+  /** "09:25:00" → 当天时间戳 */
+  private timeToday(hms: string, now: number): number | null {
+    const match = /^(\d{2}):(\d{2}):(\d{2})$/.exec(hms ?? '');
+    if (!match) return null;
+    const base: Date = new Date(now);
+    base.setHours(Number(match[1]), Number(match[2]), Number(match[3]), 0);
+    return base.getTime();
+  }
+
+  /** 用真实行情覆盖运行时行情（价格、市值、涨跌幅限制、涨跌停状态等） */
+  private applyRealQuote(quote: RealQuote): RuntimeQuote {
+    let q: RuntimeQuote | undefined = this.quotes.get(quote.code);
+    if (!q) {
+      q = this.createQuote(RealMarketDataProvider.toStockMeta(quote), Date.now());
+      this.quotes.set(quote.code, q);
+    }
+
+    const meta: StockMeta = q.stock;
+    meta.name = quote.name || meta.name;
+    meta.market = quote.market;
+    meta.board = quote.board;
+    meta.isST = quote.isST;
+    meta.isNew = quote.isNew;
+    meta.limitUpPercent = quote.limitUpPercent;
+    meta.limitDownPercent = quote.limitDownPercent;
+    if (quote.industry && quote.industry !== '未分类') {
+      meta.industry = quote.industry;
+      if (!meta.concept.includes(quote.industry)) meta.concept = [quote.industry, ...meta.concept];
+    }
+    if (quote.marketCap > 0) meta.marketCap = quote.marketCap;
+    if (quote.floatMarketCap > 0) meta.floatMarketCap = quote.floatMarketCap;
+    if (quote.price > 0 && meta.totalShares > 0) meta.totalShares = quote.marketCap / quote.price;
+    if (quote.price > 0 && meta.floatShares > 0) meta.floatShares = quote.floatMarketCap / quote.price;
+    if (quote.pe) meta.pe = quote.pe;
+    if (quote.pb) meta.pb = quote.pb;
+
+    q.price = quote.price || q.price;
+    q.prevClose = quote.prevClose || q.prevClose;
+    q.open = quote.open || q.open;
+    q.high = quote.high || q.high;
+    q.low = quote.low || q.low;
+    q.volume = quote.volume;
+    q.amount = quote.amount;
+    if (quote.bid1Price) q.bid1Price = quote.bid1Price;
+    if (quote.ask1Price) q.ask1Price = quote.ask1Price;
+    q.timestamp = quote.timestamp || Date.now();
+    q.lastRealUpdate = q.timestamp;
+    q.realSpeed = quote.speed;
+    q.realTurnover = quote.turnover;
+    if (quote.marketCap > 0) q.realMarketCap = quote.marketCap;
+    if (quote.floatMarketCap > 0) q.realFloatMarketCap = quote.floatMarketCap;
+
+    // 涨跌停判定（用交易所实际涨跌幅）；prevClose 为 0 时（停牌/无数据）不判定，避免误标涨停
+    if (q.prevClose > 0) {
+      const limitUpPrice: number = roundPrice(q.prevClose * (1 + meta.limitUpPercent));
+      const limitDownPrice: number = roundPrice(q.prevClose * (1 - meta.limitDownPercent));
+      if (!q.isLimitUp && q.price >= limitUpPrice - 0.001) {
+        q.isLimitUp = true;
+        q.status = 'sealing';
+        if (q.firstSealTime === null) q.firstSealTime = q.timestamp;
+        if (q.lastSealTime === null) q.lastSealTime = q.timestamp;
+        q.isOneWordLimitUp = q.open >= limitUpPrice - 0.001;
+      } else if (!q.isLimitUp) {
+        q.isLimitUp = false;
+        if (q.status !== 'broken') q.status = 'normal';
+      }
+      q.isLimitDown = q.price <= limitDownPrice + 0.001;
+    }
+
+    const minute: number = Math.floor(q.timestamp / MINUTE_MS);
+    const lastSnap: { time: number; price: number } | undefined = q.priceHistory[q.priceHistory.length - 1];
+    if (!lastSnap || Math.floor(lastSnap.time / MINUTE_MS) !== minute) {
+      q.priceHistory.push({ time: q.timestamp, price: q.price });
+      if (q.priceHistory.length > 240) q.priceHistory.shift();
+    }
+    return q;
+  }
+
+  private logMarketCoverage(): void {
+    const coverage: MarketCoverage = this.getMarketCoverage();
+    for (const item of coverage.boards) {
+      this.logger.log(`  ${item.label}：${item.count} 只（示例 ${item.sampleCodes.slice(0, 3).join('、')}）`);
+    }
+  }
+
+  // ==========================================================
+  // 模拟行情（兜底，仅当真实源全部不可用或显式配置 mock 时使用）
+  // ==========================================================
+  private initMockData(): void {
     const stocks: MockStock[] = generateMockStocks();
     const now: number = Date.now();
-    this.startTime = now;
 
     for (const stock of stocks) {
-      const prevClose: number = roundPrice(stock.basePrice * (1 + (Math.random() - 0.5) * 0.02));
-      const open: number = roundPrice(prevClose * (1 + (Math.random() - 0.5) * 0.015));
-      const price: number = open;
-      const limitUpPrice: number = roundPrice(prevClose * (1 + stock.limitUpPercent));
-      const limitDownPrice: number = roundPrice(prevClose * (1 - stock.limitDownPercent));
-
-      const quote: RuntimeQuote = {
-        stock,
-        price,
-        prevClose,
-        open,
-        high: Math.max(open, price),
-        low: Math.min(open, price),
-        volume: Math.floor(Math.random() * 10000),
-        amount: Math.floor(Math.random() * 1e7),
-        bid1Price: roundPrice(price - 0.01),
-        bid1Volume: Math.floor(Math.random() * 500),
-        ask1Price: roundPrice(price + 0.01),
-        ask1Volume: Math.floor(Math.random() * 500),
-        isLimitUp: false,
-        isLimitDown: false,
-        isOneWordLimitUp: false,
-        firstSealTime: null,
-        lastSealTime: null,
-        firstBreakTime: null,
-        lastBreakTime: null,
-        openCount: 0,
-        sealAmount: 0,
-        status: 'normal',
-        timeline: [],
-        priceHistory: [{ time: now, price }],
-        lastMinuteSnap: [],
-        timestamp: now,
-        momentumPhase: 'none',
-        momentumRemaining: 0,
-      };
-
-      this.quotes.set(stock.code, quote);
+      this.quotes.set(stock.code, this.createQuote(stock, now));
     }
 
     this.seedInitialLimitUps();
+    this.startMockTick();
+    this.logger.warn(`已启用模拟数据引擎（非真实行情），共 ${this.quotes.size} 只股票`);
+    this.logMarketCoverage();
+  }
+
+  private startMockTick(): void {
+    if (this.tickInterval) return;
+    this.tickInterval = setInterval((): void => {
+      this.tick();
+    }, 1000);
+  }
+
+  /** 由静态股票信息创建运行时行情（批量初始化与「按需纳入监控」共用） */
+  private createQuote(stock: MockStock, now: number = Date.now()): RuntimeQuote {
+    const prevClose: number = roundPrice(stock.basePrice * (1 + (Math.random() - 0.5) * 0.02));
+    const open: number = roundPrice(prevClose * (1 + (Math.random() - 0.5) * 0.015));
+    const price: number = open;
+
+    return {
+      stock,
+      price,
+      prevClose,
+      open,
+      high: Math.max(open, price),
+      low: Math.min(open, price),
+      volume: Math.floor(Math.random() * 10000),
+      amount: Math.floor(Math.random() * 1e7),
+      bid1Price: roundPrice(price - 0.01),
+      bid1Volume: Math.floor(Math.random() * 500),
+      ask1Price: roundPrice(price + 0.01),
+      ask1Volume: Math.floor(Math.random() * 500),
+      isLimitUp: false,
+      isLimitDown: false,
+      isOneWordLimitUp: false,
+      firstSealTime: null,
+      lastSealTime: null,
+      firstBreakTime: null,
+      lastBreakTime: null,
+      openCount: 0,
+      sealAmount: 0,
+      status: 'normal',
+      timeline: [],
+      priceHistory: [{ time: now, price }],
+      lastMinuteSnap: [],
+      timestamp: now,
+      momentumPhase: 'none',
+      momentumRemaining: 0,
+      realSpeed: 0,
+      realTurnover: 0,
+      realMarketCap: 0,
+      realFloatMarketCap: 0,
+      lastRealUpdate: 0,
+    };
   }
 
   private seedInitialLimitUps(): void {
@@ -349,14 +712,32 @@ export class MarketDataService implements OnModuleInit {
   private toStockQuote(q: RuntimeQuote): StockQuote {
     const stock: MockStock = q.stock;
     const change: number = roundPrice(q.price - q.prevClose);
-    const changePercent: number = roundPrice((change / q.prevClose) * 100);
+    // 停牌/无昨收数据（prevClose=0）时不做涨跌幅计算，避免 NaN
+    const changePercent: number = q.prevClose > 0 ? roundPrice((change / q.prevClose) * 100) : 0;
     const limitUpPrice: number = roundPrice(q.prevClose * (1 + stock.limitUpPercent));
     const limitDownPrice: number = roundPrice(q.prevClose * (1 - stock.limitDownPercent));
-    const turnover: number = roundPrice((q.volume * 100 / stock.floatShares) * 100);
+    // 换手率/PE/PB 优先用行情源提供的真实值，取不到时才按股本推算
+    const derivedTurnover: number = stock.floatShares > 0
+      ? roundPrice((q.volume * 100 / stock.floatShares) * 100)
+      : 0;
+    const turnover: number = q.realTurnover > 0 ? roundPrice(q.realTurnover) : derivedTurnover;
+    const derivedPe: number = stock.netProfit > 0
+      ? roundPrice((q.price * stock.totalShares) / stock.netProfit)
+      : 0;
+    const derivedPb: number = stock.basePrice > 0 && stock.pb > 0
+      ? roundPrice((q.price / stock.basePrice) * stock.pb)
+      : 0;
 
     return {
       code: stock.code,
       name: stock.name,
+      // 板块/交易所信息必须回传：前端按此显示 沪市主板/深市主板/创业板/科创板/北交所
+      market: stock.market,
+      board: stock.board,
+      isST: stock.isST,
+      isNew: stock.isNew,
+      limitUpPercent: stock.limitUpPercent,
+      limitDownPercent: stock.limitDownPercent,
       price: q.price,
       prevClose: q.prevClose,
       open: q.open,
@@ -373,10 +754,10 @@ export class MarketDataService implements OnModuleInit {
       bid1Volume: q.bid1Volume,
       ask1Price: q.ask1Price,
       ask1Volume: q.ask1Volume,
-      marketCap: Math.floor(q.price * stock.totalShares),
-      floatMarketCap: Math.floor(q.price * stock.floatShares),
-      pe: roundPrice(q.price * stock.totalShares / (stock.netProfit || 1)),
-      pb: roundPrice(q.price * stock.totalShares / (stock.totalShares * stock.basePrice / stock.pb)),
+      marketCap: Math.floor(q.realMarketCap > 0 ? q.realMarketCap : q.price * stock.totalShares),
+      floatMarketCap: Math.floor(q.realFloatMarketCap > 0 ? q.realFloatMarketCap : q.price * stock.floatShares),
+      pe: stock.pe > 0 ? roundPrice(stock.pe) : derivedPe,
+      pb: stock.pb > 0 ? roundPrice(stock.pb) : derivedPb,
       industry: stock.industry,
       concept: [...stock.concept],
       isLimitUp: q.isLimitUp,
@@ -386,23 +767,151 @@ export class MarketDataService implements OnModuleInit {
     };
   }
 
-  getQuote(code: string): StockQuote {
-    const q: RuntimeQuote | undefined = this.quotes.get(code);
-    if (!q) {
-      throw new NotFoundException(`股票 ${code} 不存在`);
+  /**
+   * 取行情：优先用已加载的真实行情；不在池内时按需向真实数据源请求，
+   * 只要代码属于沪深主板/创业板/科创板/北交所任一板块就纳入监控（不遗漏任何 A 股）。
+   * 显式配置 MARKET_DATA_SOURCE=mock 时退化为本地生成。
+   */
+  private async ensureQuoteAsync(codeInput: string): Promise<RuntimeQuote> {
+    const code: string | null = normalizeStockCode(codeInput);
+    if (!code) {
+      throw new NotFoundException(`股票代码不合法：${codeInput}`);
     }
-    return this.toStockQuote(q);
+
+    const cached: RuntimeQuote | undefined = this.quotes.get(code);
+    if (cached && (this.dataSource === 'mock' || Date.now() - cached.lastRealUpdate < this.fullSnapshotIntervalMs)) {
+      return cached;
+    }
+    if (!classifyAShareCode(code)) {
+      throw new NotFoundException(`股票 ${code} 不是交易所 A 股（仅支持沪深主板/创业板/科创板/北交所）`);
+    }
+
+    if (this.dataSource === 'mock') {
+      if (this.quotes.size >= this.universeLimit) {
+        throw new NotFoundException(`监控股票数已达上限 ${this.universeLimit}，无法再纳入 ${code}`);
+      }
+      const stock: MockStock = buildMockStockForCode(code);
+      const quote: RuntimeQuote = this.createQuote(stock);
+      this.quotes.set(stock.code, quote);
+      return quote;
+    }
+
+    // 真实行情模式：单只详情 → 批量行情 → 失败即视为不存在
+    const detail: RealQuote | null = await this.provider.fetchStockDetail(code);
+    if (detail) return this.applyRealQuote(detail);
+    const [fallback] = await this.provider.fetchQuotes([code]);
+    if (fallback) return this.applyRealQuote(fallback);
+    throw new NotFoundException(`未获取到 ${code} 的真实行情（代码不存在或行情源暂不可用）`);
   }
 
-  getBatchQuotes(codes: string[]): StockQuote[] {
+  /** 换手率：优先使用行情源真实值，缺失时按流通股本推算 */
+  private quoteTurnover(q: RuntimeQuote): number {
+    if (q.realTurnover > 0) return roundPrice(q.realTurnover);
+    return q.stock.floatShares > 0
+      ? roundPrice((q.volume * 100 / q.stock.floatShares) * 100)
+      : 0;
+  }
+
+  /** 流通市值：优先使用行情源真实值 */
+  private quoteFloatMarketCap(q: RuntimeQuote): number {
+    return Math.floor(q.realFloatMarketCap > 0 ? q.realFloatMarketCap : q.price * q.stock.floatShares);
+  }
+
+  /** 总市值：优先使用行情源真实值 */
+  private quoteMarketCap(q: RuntimeQuote): number {
+    return Math.floor(q.realMarketCap > 0 ? q.realMarketCap : q.price * q.stock.totalShares);
+  }
+
+  async getQuote(code: string): Promise<StockQuote> {
+    return this.toStockQuote(await this.ensureQuoteAsync(code));
+  }
+
+  async getBatchQuotes(codes: string[]): Promise<StockQuote[]> {
     const result: StockQuote[] = [];
     for (const code of codes) {
-      const q: RuntimeQuote | undefined = this.quotes.get(code);
-      if (q) {
-        result.push(this.toStockQuote(q));
+      try {
+        result.push(this.toStockQuote(await this.ensureQuoteAsync(code)));
+      } catch {
+        // 非法代码或行情源无该标的时跳过，不影响其它股票
       }
     }
     return result;
+  }
+
+  /** 按需加载真实财务/概念/日K并写入缓存（个股研究、多股对比使用） */
+  private async enrichReal(code: string): Promise<void> {
+    if (this.dataSource === 'mock' || this.enrichmentCache.has(code)) return;
+    const q: RuntimeQuote | undefined = this.quotes.get(code);
+    if (!q) return;
+
+    const [financials, concepts, bars] = await Promise.all([
+      this.provider.fetchFinancials(code),
+      this.provider.fetchConcepts(code),
+      this.provider.fetchDailyBars(code, 250),
+    ]);
+
+    const entry = {
+      roe: financials?.roe ?? 0,
+      revenue: financials?.revenue ?? 0,
+      netProfit: financials?.netProfit ?? 0,
+      grossMargin: financials?.grossMargin ?? 0,
+      concepts: concepts,
+      bars: bars.map((bar): { date: string; close: number } => ({ date: bar.date, close: bar.close })),
+    };
+    this.enrichmentCache.set(code, entry);
+
+    // 真实财务与概念回填到运行时元信息，选股/研究/对比都随即可用
+    if (entry.revenue > 0) q.stock.revenue = entry.revenue;
+    if (entry.netProfit !== 0) q.stock.netProfit = entry.netProfit;
+    if (entry.roe !== 0) q.stock.roe = entry.roe;
+    if (entry.grossMargin > 0) q.stock.grossMargin = entry.grossMargin / 100;
+    if (financials?.industry && financials.industry !== q.stock.industry) {
+      q.stock.industry = financials.industry;
+    }
+    if (entry.concepts.length) {
+      q.stock.concept = Array.from(new Set([...entry.concepts, q.stock.industry])).slice(0, 12);
+    }
+  }
+
+  /** 监控覆盖度：各交易所板块的股票数量与示例代码 */
+  getMarketCoverage(): MarketCoverage {
+    const groups: Map<string, { market: Market; board: Board; codes: string[] }> = new Map();
+
+    for (const q of this.quotes.values()) {
+      const key: string = `${q.stock.market}:${q.stock.board}`;
+      const group = groups.get(key);
+      if (group) {
+        group.codes.push(q.stock.code);
+      } else {
+        groups.set(key, { market: q.stock.market, board: q.stock.board, codes: [q.stock.code] });
+      }
+    }
+
+    const boards: BoardCoverage[] = [];
+    for (const group of groups.values()) {
+      group.codes.sort();
+      boards.push({
+        market: group.market,
+        board: group.board,
+        label: boardFullLabel(group.market, group.board),
+        count: group.codes.length,
+        sampleCodes: group.codes.slice(0, 8),
+      });
+    }
+
+    // 固定顺序：沪市主板 → 深市主板 → 创业板 → 科创板 → 北交所
+    boards.sort((a: BoardCoverage, b: BoardCoverage): number => {
+      if (a.board !== b.board) {
+        return BOARD_ORDER.indexOf(a.board) - BOARD_ORDER.indexOf(b.board);
+      }
+      return a.market === 'sh' ? -1 : 1;
+    });
+
+    return {
+      total: this.quotes.size,
+      updatedAt: Date.now(),
+      boards,
+    };
   }
 
   getSurgeBoard(
@@ -418,14 +927,25 @@ export class MarketDataService implements OnModuleInit {
       if (excludeST && q.stock.isST) continue;
       if (sector && q.stock.industry !== sector) continue;
 
+      // 优先用服务自身累计的分钟样本（与所选窗口一致）；
+      // 刚启动样本不足时回落到行情源提供的 5 分钟涨速（东财 f22），保证涨速榜开箱即有数据。
       const snaps: { time: number; price: number }[] = q.lastMinuteSnap;
-      if (snaps.length < windowMinutes + 1) continue;
+      let surgePercent: number = 0;
+      let window: number = windowMinutes;
+      let refPrice: number = 0;
 
-      const refIdx: number = snaps.length - windowMinutes - 1;
-      const refPrice: number = snaps[refIdx]?.price ?? q.price;
-      if (refPrice <= 0) continue;
-
-      const surgePercent: number = roundPrice(((q.price - refPrice) / refPrice) * 100 / windowMinutes * 100) / 100;
+      if (snaps.length >= windowMinutes + 1) {
+        const refIdx: number = snaps.length - windowMinutes - 1;
+        refPrice = snaps[refIdx]?.price ?? q.price;
+        if (refPrice <= 0) continue;
+        surgePercent = roundPrice(((q.price - refPrice) / refPrice) * 100 / windowMinutes * 100) / 100;
+      } else if (q.realSpeed !== 0) {
+        surgePercent = roundPrice(q.realSpeed);
+        window = 5;
+        refPrice = q.prevClose;
+      } else {
+        continue;
+      }
 
       if (surgePercent < threshold) continue;
 
@@ -435,13 +955,15 @@ export class MarketDataService implements OnModuleInit {
       items.push({
         code: q.stock.code,
         name: q.stock.name,
+        market: q.stock.market,
+        board: q.stock.board,
         price: q.price,
         surgePercent,
         changePercent,
-        windowMinutes,
+        windowMinutes: window,
         referencePrice: refPrice,
         amount: Math.floor(q.amount),
-        turnover: roundPrice((q.volume * 100 / q.stock.floatShares) * 100),
+        turnover: this.quoteTurnover(q),
         industry: q.stock.industry,
         isST: q.stock.isST,
         isOneWordLimitUp: q.isOneWordLimitUp,
@@ -490,6 +1012,8 @@ export class MarketDataService implements OnModuleInit {
       result.push({
         code: q.stock.code,
         name: q.stock.name,
+        market: q.stock.market,
+        board: q.stock.board,
         price: q.price,
         limitUpPrice,
         changePercent,
@@ -500,10 +1024,10 @@ export class MarketDataService implements OnModuleInit {
         sealAmount: Math.floor(q.sealAmount),
         sealFloatRatio,
         amount,
-        turnover: roundPrice((q.volume * 100 / q.stock.floatShares) * 100),
+        turnover: this.quoteTurnover(q),
         reason,
         industry: q.stock.industry,
-        floatMarketCap: Math.floor(q.price * q.stock.floatShares),
+        floatMarketCap: this.quoteFloatMarketCap(q),
         status,
         sealStrength,
         isST: q.stock.isST,
@@ -587,6 +1111,8 @@ export class MarketDataService implements OnModuleInit {
       result.push({
         code: q.stock.code,
         name: q.stock.name,
+        market: q.stock.market,
+        board: q.stock.board,
         price: q.price,
         limitUpPrice,
         changePercent,
@@ -598,7 +1124,7 @@ export class MarketDataService implements OnModuleInit {
         sealAmountBeforeBreak: Math.floor(q.sealAmount),
         priceDiffFromLimit,
         amount: Math.floor(q.amount),
-        turnover: roundPrice((q.volume * 100 / q.stock.floatShares) * 100),
+        turnover: this.quoteTurnover(q),
         industry: q.stock.industry,
         isInWatchlist: false,
         timeline: [...q.timeline],
@@ -637,7 +1163,15 @@ export class MarketDataService implements OnModuleInit {
     const totalAttempts: number = sealTotal + brokenTotal;
     const brokenRate: number = totalAttempts > 0 ? roundPrice((brokenTotal / totalAttempts) * 100) : 0;
     const sealRate: number = totalAttempts > 0 ? roundPrice((sealTotal / totalAttempts) * 100) : 100;
-    const promotionRate: number = roundPrice(60 + Math.random() * 20);
+    // 真实行情下用「连板股（≥2 连板）占涨停家数比例」近似晋级率；模拟数据保持演示值
+    let promotionRate: number = roundPrice(60 + Math.random() * 20);
+    if (this.dataSource !== 'mock') {
+      let multiBoard: number = 0;
+      for (const q of this.quotes.values()) {
+        if (q.stock.consecutiveDays >= 2) multiBoard += 1;
+      }
+      promotionRate = limitUpCount > 0 ? roundPrice((multiBoard / limitUpCount) * 100) : 0;
+    }
 
     return {
       limitUpCount,
@@ -696,11 +1230,9 @@ export class MarketDataService implements OnModuleInit {
     return result;
   }
 
-  getResearch(code: string): StockResearch {
-    const q: RuntimeQuote | undefined = this.quotes.get(code);
-    if (!q) {
-      throw new NotFoundException(`股票 ${code} 不存在`);
-    }
+  async getResearch(code: string): Promise<StockResearch> {
+    const q: RuntimeQuote = await this.ensureQuoteAsync(code);
+    await this.enrichReal(q.stock.code);
 
     const stock: MockStock = q.stock;
     const quote: StockQuote = this.toStockQuote(q);
@@ -712,7 +1244,7 @@ export class MarketDataService implements OnModuleInit {
         shortName: stock.name,
         code: stock.code,
         listingDate: '2015-06-15',
-        exchange: stock.market === 'sh' ? '上海证券交易所' : stock.market === 'sz' ? '深圳证券交易所' : '北京证券交易所',
+        exchange: MARKET_LABELS[stock.market],
         industry: stock.industry,
         mainBusiness: `${stock.industry}相关产品的研发、生产与销售，核心产品覆盖${stock.concept.slice(0, 2).join('、')}等领域。`,
       },
@@ -813,64 +1345,83 @@ export class MarketDataService implements OnModuleInit {
     };
   }
 
-  getCompare(codes: string[]): StockCompare {
-    const validQuotes: RuntimeQuote[] = codes
-      .map((code: string): RuntimeQuote | undefined => this.quotes.get(code))
-      .filter((q): q is RuntimeQuote => q !== undefined);
+  async getCompare(codes: string[]): Promise<StockCompare> {
+    const validQuotes: RuntimeQuote[] = [];
+    for (const code of codes) {
+      try {
+        validQuotes.push(await this.ensureQuoteAsync(code));
+      } catch {
+        // 无效代码跳过
+      }
+    }
+    if (this.dataSource !== 'mock') {
+      await Promise.all(validQuotes.map((q: RuntimeQuote): Promise<void> => this.enrichReal(q.stock.code)));
+    }
 
     const pricePerformance: StockCompare['pricePerformance'] = {};
     const financialSnapshot: StockCompare['financialSnapshot'] = {};
     const valuation: StockCompare['valuation'] = {};
-    const series: { code: string; name: string; data: number[] }[] = [];
-    const dates: string[] = [];
+    const series: { code: string; name: string; data: number[]; dates: string[] }[] = [];
 
     const days: number = 60;
+    const fallbackDates: string[] = [];
     const baseDate: Date = new Date();
     for (let i: number = days - 1; i >= 0; i -= 1) {
-      const d: Date = new Date(baseDate.getTime() - i * 24 * 3600 * 1000);
-      dates.push(d.toISOString().slice(0, 10));
+      fallbackDates.push(new Date(baseDate.getTime() - i * 24 * 3600 * 1000).toISOString().slice(0, 10));
     }
 
     for (const q of validQuotes) {
       const stock: MockStock = q.stock;
-      const changePercent: number = (q.price - q.prevClose) / q.prevClose * 100;
+      const changePercent: number = q.prevClose > 0 ? ((q.price - q.prevClose) / q.prevClose) * 100 : 0;
+      const bars: { date: string; close: number }[] = this.enrichmentCache.get(stock.code)?.bars ?? [];
 
-      pricePerformance[stock.code] = {
-        day1: roundPrice(changePercent),
-        day5: roundPrice(changePercent * 2.5 + (Math.random() - 0.5) * 5),
-        day20: roundPrice(changePercent * 4 + (Math.random() - 0.5) * 15),
-        day60: roundPrice(changePercent * 6 + (Math.random() - 0.5) * 30),
-        yearToDate: roundPrice(changePercent * 8 + (Math.random() - 0.5) * 40),
-      };
+      pricePerformance[stock.code] = this.buildPerformance(changePercent, bars);
 
       financialSnapshot[stock.code] = {
         revenue: Math.floor(stock.revenue),
         netProfit: Math.floor(stock.netProfit),
         roe: stock.roe,
         grossMargin: roundPrice(stock.grossMargin * 100),
-        netMargin: roundPrice((stock.netProfit / stock.revenue) * 100),
-        debtRatio: roundPrice(20 + Math.random() * 40),
+        netMargin: stock.revenue > 0 ? roundPrice((stock.netProfit / stock.revenue) * 100) : 0,
+        // 资产负债率需要财报负债字段，当前数据源未提供，置 0 表示未知（不再编造）
+        debtRatio: 0,
       };
 
       valuation[stock.code] = {
-        pe: roundPrice(q.price * stock.totalShares / (stock.netProfit || 1)),
-        pb: stock.pb,
-        ps: roundPrice(q.price * stock.totalShares / stock.revenue),
-        dividendYield: roundPrice(0.5 + Math.random() * 3),
+        pe: roundPrice(stock.pe),
+        pb: roundPrice(stock.pb),
+        ps: stock.revenue > 0 && stock.totalShares > 0
+          ? roundPrice((q.price * stock.totalShares) / stock.revenue)
+          : 0,
+        dividendYield: 0,
       };
 
-      // 价格走势数据
-      const priceData: number[] = [];
-      let basePrice: number = q.price * (1 + (Math.random() - 0.5) * 0.2);
-      for (let i: number = 0; i < days; i += 1) {
-        basePrice *= 1 + (Math.random() - 0.48) * 0.03;
-        priceData.push(roundPrice(basePrice));
+      // 价格走势：使用真实日K；取不到时不编造走势，用当前价铺平
+      const priceData: number[] = bars.length ? bars.map((bar): number => bar.close) : [];
+      if (!priceData.length) {
+        for (let i: number = 0; i < days; i += 1) priceData.push(q.price);
       }
-      // 最后一天对齐到当前价
-      priceData[days - 1] = q.price;
-
-      series.push({ code: stock.code, name: stock.name, data: priceData });
+      priceData[priceData.length - 1] = q.price;
+      series.push({
+        code: stock.code,
+        name: stock.name,
+        data: priceData,
+        dates: bars.length ? bars.map((bar): string => bar.date) : fallbackDates.slice(-priceData.length),
+      });
     }
+
+    // 各序列按尾部对齐，避免图表日期轴与数据错位
+    const minLength: number = series.length
+      ? Math.min(...series.map((item): number => item.data.length))
+      : days;
+    const chartDates: string[] = series.length
+      ? series[0].dates.slice(-minLength)
+      : fallbackDates;
+    const chartSeries = series.map((item): { code: string; name: string; data: number[] } => ({
+      code: item.code,
+      name: item.name,
+      data: item.data.slice(-minLength),
+    }));
 
     const diffExplanation: string = validQuotes.length >= 2
       ? `${validQuotes[0].stock.name}在${validQuotes[0].stock.industry}领域偏重于${validQuotes[0].stock.concept[0]}，而${validQuotes[1].stock.name}则在${validQuotes[1].stock.concept[0]}方向布局更深。两者在业务结构、盈利质量、估值水平上存在显著差异，建议根据投资风格匹配选择。`
@@ -881,8 +1432,55 @@ export class MarketDataService implements OnModuleInit {
       pricePerformance,
       financialSnapshot,
       valuation,
-      priceChartData: { dates, series },
+      priceChartData: { dates: chartDates, series: chartSeries },
       diffExplanation,
+    };
+  }
+
+  /** 用真实日K计算区间涨跌幅（1/5/20/60 日与年初至今）；无K线数据时仅返回当日涨跌幅 */
+  private buildPerformance(
+    changePercent: number,
+    bars: { date: string; close: number }[],
+  ): { day1: number; day5: number; day20: number; day60: number; yearToDate: number } {
+    const last: number = bars.length ? bars[bars.length - 1].close : 0;
+    if (!bars.length || last <= 0) {
+      return {
+        day1: roundPrice(changePercent),
+        day5: 0,
+        day20: 0,
+        day60: 0,
+        yearToDate: 0,
+      };
+    }
+
+    const changeFrom = (offset: number): number => {
+      const index: number = bars.length - 1 - offset;
+      if (index < 0) return 0;
+      const reference: number = bars[index].close;
+      return reference > 0 ? roundPrice(((last - reference) / reference) * 100) : 0;
+    };
+
+    // 年初至今：以今年第一个交易日之前最后一个收盘价为基准
+    const currentYear: string = String(new Date().getFullYear());
+    const firstThisYear: number = bars.findIndex((bar): boolean => bar.date.startsWith(currentYear));
+    let yearToDate: number = 0;
+    if (firstThisYear > 0) {
+      const reference: number = bars[firstThisYear - 1].close;
+      if (reference > 0) yearToDate = roundPrice(((last - reference) / reference) * 100);
+    } else if (firstThisYear === 0) {
+      const reference: number = bars[0].close;
+      if (reference > 0) yearToDate = 0;
+    } else {
+      const reference: number = bars[0].close;
+      if (reference > 0) yearToDate = roundPrice(((last - reference) / reference) * 100);
+    }
+
+    return {
+      day1: changeFrom(1),
+      day5: changeFrom(5),
+      day20: changeFrom(20),
+      day60: changeFrom(60),
+      yearToDate,
     };
   }
 
@@ -892,9 +1490,9 @@ export class MarketDataService implements OnModuleInit {
     for (const q of this.quotes.values()) {
       const stock: MockStock = q.stock;
       const changePercent: number = roundPrice(((q.price - q.prevClose) / q.prevClose) * 100);
-      const turnover: number = roundPrice((q.volume * 100 / stock.floatShares) * 100);
-      const pe: number = roundPrice(q.price * stock.totalShares / (stock.netProfit || 1));
-      const marketCap: number = Math.floor(q.price * stock.totalShares);
+      const turnover: number = this.quoteTurnover(q);
+      const pe: number = stock.pe > 0 ? roundPrice(stock.pe) : roundPrice(q.price * stock.totalShares / (stock.netProfit || 1));
+      const marketCap: number = this.quoteMarketCap(q);
 
       if (conditions.industry && conditions.industry.length > 0
         && !conditions.industry.includes(stock.industry)) continue;
@@ -930,6 +1528,8 @@ export class MarketDataService implements OnModuleInit {
       results.push({
         code: stock.code,
         name: stock.name,
+        market: stock.market,
+        board: stock.board,
         price: q.price,
         changePercent,
         tier,
@@ -953,15 +1553,32 @@ export class MarketDataService implements OnModuleInit {
     };
   }
 
-  searchStocks(keyword: string): StockQuote[] {
+  async searchStocks(keyword: string): Promise<StockQuote[]> {
     const kw: string = keyword.toLowerCase().trim();
     if (!kw) return [];
 
     const results: StockQuote[] = [];
+    const seen: Set<string> = new Set();
+
+    // 完整 A 股代码（沪市主板/深市主板/创业板/科创板/北交所任意号段）直接命中真实行情，
+    // 不在已加载列表里的代码也会按需拉取，避免「搜索不到 → 无法加入自选」的遗漏。
+    const exactCode: string | null = normalizeStockCode(kw);
+    if (exactCode && classifyAShareCode(exactCode)) {
+      try {
+        const exact: RuntimeQuote = await this.ensureQuoteAsync(exactCode);
+        results.push(this.toStockQuote(exact));
+        seen.add(exact.stock.code);
+      } catch {
+        // 行情源无该标的时忽略，继续按关键字模糊匹配
+      }
+    }
+
     for (const q of this.quotes.values()) {
+      if (results.length >= 20) break;
+      if (seen.has(q.stock.code)) continue;
       if (q.stock.code.includes(kw) || q.stock.name.toLowerCase().includes(kw)) {
         results.push(this.toStockQuote(q));
-        if (results.length >= 20) break;
+        seen.add(q.stock.code);
       }
     }
     return results;

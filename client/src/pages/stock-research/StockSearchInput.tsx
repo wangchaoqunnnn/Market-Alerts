@@ -4,6 +4,7 @@ import { Search, X } from 'lucide-react';
 
 import { marketDataApi } from '@client/src/api';
 import type { StockBase } from '@shared/api.interface';
+import { boardFullLabel } from '@shared/a-share';
 
 interface StockSearchInputProps {
   onSelect: (code: string, name: string) => void;
@@ -108,7 +109,7 @@ const StockSearchInput = ({
                   {stock.code}
                 </span>
                 <span className="text-xs text-text-muted">
-                  {stock.board === 'gem' ? '创业板' : stock.board === 'star' ? '科创板' : stock.board === 'bj' ? '北交所' : '主板'}
+                  {boardFullLabel(stock.market, stock.board)}
                 </span>
               </div>
               <span className="text-xs text-text-muted">

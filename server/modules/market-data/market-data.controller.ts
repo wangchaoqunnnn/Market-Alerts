@@ -24,6 +24,7 @@ import type {
   LimitUpGroupsResponse,
   LimitBrokenSectorStat,
   MarketStatus,
+  MarketCoverage,
 } from '@shared/api.interface.ts';
 import { MarketDataService } from './market-data.service';
 
@@ -34,9 +35,9 @@ export class MarketDataController {
   constructor(private readonly marketDataService: MarketDataService) {}
 
   @Get('quote/:code')
-  getQuote(@Param('code') code: string): StockQuote {
+  async getQuote(@Param('code') code: string): Promise<StockQuote> {
     try {
-      return this.marketDataService.getQuote(code);
+      return await this.marketDataService.getQuote(code);
     } catch (error) {
       this.logger.error(`获取行情失败: ${code}`, error instanceof Error ? error.stack : String(error));
       if (error instanceof HttpException) throw error;
@@ -45,10 +46,10 @@ export class MarketDataController {
   }
 
   @Get('quotes/batch')
-  getBatchQuotes(@Query('codes') codes?: string): StockQuote[] {
+  async getBatchQuotes(@Query('codes') codes?: string): Promise<StockQuote[]> {
     try {
       const codeList: string[] = codes ? codes.split(',').filter(Boolean) : [];
-      return this.marketDataService.getBatchQuotes(codeList);
+      return await this.marketDataService.getBatchQuotes(codeList);
     } catch (error) {
       this.logger.error('批量获取行情失败', error instanceof Error ? error.stack : String(error));
       throw new HttpException('批量获取行情失败', HttpStatus.INTERNAL_SERVER_ERROR);
@@ -141,9 +142,9 @@ export class MarketDataController {
   }
 
   @Get('research/:code')
-  getResearch(@Param('code') code: string): StockResearch {
+  async getResearch(@Param('code') code: string): Promise<StockResearch> {
     try {
-      return this.marketDataService.getResearch(code);
+      return await this.marketDataService.getResearch(code);
     } catch (error) {
       this.logger.error(`获取个股研究失败: ${code}`, error instanceof Error ? error.stack : String(error));
       if (error instanceof HttpException) throw error;
@@ -152,10 +153,10 @@ export class MarketDataController {
   }
 
   @Post('compare')
-  getCompare(@Body() body: { codes: string[] }): StockCompare {
+  async getCompare(@Body() body: { codes: string[] }): Promise<StockCompare> {
     try {
       const codes: string[] = body?.codes ?? [];
-      return this.marketDataService.getCompare(codes);
+      return await this.marketDataService.getCompare(codes);
     } catch (error) {
       this.logger.error('多股对比失败', error instanceof Error ? error.stack : String(error));
       throw new HttpException('多股对比失败', HttpStatus.INTERNAL_SERVER_ERROR);
@@ -173,9 +174,9 @@ export class MarketDataController {
   }
 
   @Get('stocks/search')
-  searchStocks(@Query('keyword') keyword?: string): StockQuote[] {
+  async searchStocks(@Query('keyword') keyword?: string): Promise<StockQuote[]> {
     try {
-      return this.marketDataService.searchStocks(keyword ?? '');
+      return await this.marketDataService.searchStocks(keyword ?? '');
     } catch (error) {
       this.logger.error('搜索股票失败', error instanceof Error ? error.stack : String(error));
       throw new HttpException('搜索股票失败', HttpStatus.INTERNAL_SERVER_ERROR);
@@ -199,6 +200,20 @@ export class MarketDataController {
     } catch (error) {
       this.logger.error('获取行业列表失败', error instanceof Error ? error.stack : String(error));
       throw new HttpException('获取行业列表失败', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+  }
+
+  /**
+   * 监控覆盖度：查看沪市主板/深市主板/创业板/科创板/北交所各板块股票数量，
+   * 用于确认「所有交易所的股票都已纳入监控」。
+   */
+  @Get('market-coverage')
+  getMarketCoverage(): MarketCoverage {
+    try {
+      return this.marketDataService.getMarketCoverage();
+    } catch (error) {
+      this.logger.error('获取监控覆盖度失败', error instanceof Error ? error.stack : String(error));
+      throw new HttpException('获取监控覆盖度失败', HttpStatus.INTERNAL_SERVER_ERROR);
     }
   }
 }

@@ -16,6 +16,13 @@ export interface StockBase {
 export interface StockQuote {
   code: string;
   name: string;
+  // 交易所与板块：覆盖沪市主板 / 深市主板 / 创业板 / 科创板 / 北交所
+  market: 'sh' | 'sz' | 'bj';
+  board: 'main' | 'gem' | 'star' | 'bj';
+  isST: boolean;
+  isNew: boolean;
+  limitUpPercent: number;
+  limitDownPercent: number;
   price: number;
   prevClose: number;
   open: number;
@@ -48,6 +55,8 @@ export interface StockQuote {
 export interface SurgeItem {
   code: string;
   name: string;
+  market: 'sh' | 'sz' | 'bj';
+  board: 'main' | 'gem' | 'star' | 'bj';
   price: number;
   surgePercent: number;
   changePercent: number;
@@ -65,6 +74,8 @@ export interface SurgeItem {
 export interface LimitUpStock {
   code: string;
   name: string;
+  market: 'sh' | 'sz' | 'bj';
+  board: 'main' | 'gem' | 'star' | 'bj';
   price: number;
   limitUpPrice: number;
   changePercent: number;
@@ -99,6 +110,8 @@ export interface SealEvent {
 export interface LimitBrokenStock {
   code: string;
   name: string;
+  market: 'sh' | 'sz' | 'bj';
+  board: 'main' | 'gem' | 'star' | 'bj';
   price: number;
   limitUpPrice: number;
   changePercent: number;
@@ -157,6 +170,8 @@ export interface MarketSentiment {
 export interface ScreenResult {
   code: string;
   name: string;
+  market: 'sh' | 'sz' | 'bj';
+  board: 'main' | 'gem' | 'star' | 'bj';
   price: number;
   changePercent: number;
   tier: 'core' | 'important' | 'watch' | 'pending';
@@ -293,6 +308,21 @@ export interface ListResponse<T> {
   total: number;
   page?: number;
   pageSize?: number;
+}
+
+// ===== 监控覆盖度（确认沪市主板/深市主板/创业板/科创板/北交所均无遗漏）=====
+export interface BoardCoverage {
+  market: 'sh' | 'sz' | 'bj';
+  board: 'main' | 'gem' | 'star' | 'bj';
+  label: string;
+  count: number;
+  sampleCodes: string[];
+}
+
+export interface MarketCoverage {
+  total: number;
+  updatedAt: number;
+  boards: BoardCoverage[];
 }
 
 // 自选股

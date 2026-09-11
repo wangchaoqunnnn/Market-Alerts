@@ -88,10 +88,36 @@ server/modules/
 - alert_settings：预警设置
 - report_history：报告历史
 
-## 行情数据架构
+## 行情数据架构（已接入真实行情）
 
-- 主源：东方财富 push2 接口（后端代理）
-- 备用：腾讯财经 / 新浪财经
-- 兜底：模拟数据引擎（开发/演示用）
-- 架构：MarketDataService 统一抽象，多源自动切换
-- 刷新频率：1秒（交易时段）
+- 实现位置：`server/modules/market-data/real-market.provider.ts`（真实数据源）+ `market-data.service.ts`（调度、状态维护、对外 DTO）
+- 数据源分工：
+
+| 数据 | 来源 |
+|------|------|
+| 全市场股票列表 / 快照 / 涨速 | 东方财富 clist（`push2` 失败自动切 `push2delay`；单页上限 100 条，全 A 约 5900 只分页拉取） |
+| 涨停池 / 炸板池（封单额、首末封板时间、连板数、炸板次数） | 东方财富 `push2ex` 涨停板行情 |
+| 单只详情 / 概念板块 / 财务摘要 | 东方财富 `stock/get`、`slist`、数据中心 `RPT_LICO_FN_CPD` |
+| 批量行情（备用） | 腾讯 `qt.gtimg.cn`、新浪 `hq.sinajs.cn`（GBK） |
+| 日K线（研究 / 对比区间涨跌） | 新浪 `CN_MarketDataService.getKLineData` |
+| 兜底 | 模拟引擎，仅在 `MARKET_DATA_SOURCE=mock` 或所有真实源都不可用时启用 |
+
+- 切换与刷新配置：`MARKET_DATA_SOURCE=auto|eastmoney|tencent|sina|mock`、`REFRESH_INTERVAL_MS`（默认 5000）、`FULL_SNAPSHOT_INTERVAL_MS`（默认 60000）、`MAX_STOCKS`（默认 8000）
+- 全市场列表在服务启动后**后台分页加载**（约 6 秒），不阻塞端口监听；涨停/炸板池先加载，保证页面开门即有数据
+- 约束：数据源 URL、GBK 解码、字段映射统一收敛在 provider 内，业务代码禁止直接写死外部行情接口
+
+### 股票池覆盖范围（硬性要求：不得遗漏任何交易所板块）
+
+| 板块 | 号段 |
+|------|------|
+| 沪市主板 | 600 / 601 / 603 / 605 |
+| 沪市科创板 | 688 / 689（存托凭证） |
+| 深市主板 | 000 / 001 / 002 / 003 |
+| 深市创业板 | 300 / 301 |
+| 北交所 | 430 / 83x / 87x / 920 |
+
+- 号段识别规则统一收敛在 `shared/a-share.ts`（`classifyAShareCode` / `getPriceLimit`），前后端共用，禁止在业务代码里硬编码前缀判断
+- 任意合法 A 股代码都会**按需拉取真实行情**（搜索/自选/研究/对比均可用），不因不在已加载列表里而报「不存在」
+- 涨跌幅限制优先采用交易所实际涨停价反推（兼容 ST、次新），缺失时按板块规则：主板 10%（ST 5%）、创业板/科创板 20%、北交所 30%
+- 不纳入范围：900xxx / 200xxx（B 股）、400xxx / 88xxxx（新三板）、基金 ETF 等
+- 覆盖度自检：`GET /api/market-data/market-coverage`，服务启动日志同样会打印各板块股票数量

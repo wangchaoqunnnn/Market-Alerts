@@ -1,6 +1,13 @@
 import type { StockBase } from '@shared/api.interface';
+import {
+  classifyAShareCode,
+  getPriceLimit,
+  normalizeStockCode,
+  type Board,
+  type Market,
+} from '@shared/a-share';
 
-export interface MockStock extends StockBase {
+export interface StockMeta extends StockBase {
   industry: string;
   concept: string[];
   basePrice: number;
@@ -16,6 +23,9 @@ export interface MockStock extends StockBase {
   grossMargin: number;
   consecutiveDays: number;
 }
+
+/** 兼容旧命名（模拟与真实行情共用同一结构） */
+export type MockStock = StockMeta;
 
 export const INDUSTRIES: string[] = [
   '银行', '保险', '证券', '地产', '医药', '白酒', '新能源', '半导体',
@@ -143,158 +153,273 @@ function generateStockName(industry: string, rand: () => number): string {
   return prefix + suffix;
 }
 
+/** 板块配额：覆盖沪市主板 / 深市主板 / 创业板 / 科创板 / 北交所全部号段 */
+export interface BoardPlan {
+  market: Market;
+  board: Board;
+  /** 号段池：按真实市场占比重复排列，轮转分配，保证每个号段都有股票 */
+  prefixPool: string[];
+  /** 相对权重（近似真实 A 股市场结构：主板约 58%、创业板 25%、科创板 11%、北交所 6%） */
+  weight: number;
+  /** 每个行业至少生成的股票数，保证冷门行业也不会漏掉某个板块 */
+  minPerIndustry: number;
+}
+
+export const BOARD_PLANS: BoardPlan[] = [
+  {
+    market: 'sh',
+    board: 'main',
+    // 沪市主板：600 / 601 / 603 / 605
+    prefixPool: ['600', '600', '600', '600', '601', '601', '603', '603', '603', '605'],
+    weight: 0.3,
+    minPerIndustry: 3,
+  },
+  {
+    market: 'sz',
+    board: 'main',
+    // 深市主板：000 / 001 / 002（原中小板）/ 003
+    prefixPool: ['000', '000', '000', '001', '002', '002', '002', '002', '003'],
+    weight: 0.28,
+    minPerIndustry: 3,
+  },
+  {
+    market: 'sz',
+    board: 'gem',
+    // 深市创业板：300 / 301
+    prefixPool: ['300', '300', '300', '300', '301'],
+    weight: 0.25,
+    minPerIndustry: 2,
+  },
+  {
+    market: 'sh',
+    board: 'star',
+    // 沪市科创板：688 / 689（存托凭证）
+    prefixPool: ['688', '688', '688', '688', '689'],
+    weight: 0.11,
+    minPerIndustry: 1,
+  },
+  {
+    market: 'bj',
+    board: 'bj',
+    // 北交所：430 / 830 / 870 / 920
+    prefixPool: ['430', '430', '830', '830', '830', '830', '870', '870', '870', '920'],
+    weight: 0.06,
+    minPerIndustry: 1,
+  },
+];
+
+/** 目标股票池规模（按板块权重分配；仅影响模拟行情规模） */
+export const TARGET_UNIVERSE_SIZE: number = 620;
+
+/** 保留代码：由固定标的占用，生成器跳过（600519 贵州茅台） */
+const RESERVED_CODES: Set<string> = new Set(['600519']);
+
+/** 代码 → 确定性随机数：同一只股票每次得到的名称/价格等完全一致 */
+export function seededRandomForCode(code: string): () => number {
+  let hash: number = 0;
+  for (let i: number = 0; i < code.length; i += 1) {
+    hash = (hash * 31 + code.charCodeAt(i)) % 2147483647;
+  }
+  return seededRandom(hash === 0 ? 20240909 : hash);
+}
+
+export interface MockStockSeed {
+  code: string;
+  market: Market;
+  board: Board;
+  industry: string;
+  rand: () => number;
+  /** 传入时用于名称去重（批量生成时复用同一集合） */
+  takenNames?: Set<string>;
+}
+
+/** 构造单只股票的全部字段：批量生成与「按需纳入监控」共用同一套逻辑 */
+export function buildMockStock(seed: MockStockSeed): MockStock {
+  const { code, market, board, industry, rand } = seed;
+
+  let name: string = generateStockName(industry, rand);
+  if (seed.takenNames) {
+    let attempts: number = 0;
+    while (seed.takenNames.has(name) && attempts < 20) {
+      name = generateStockName(industry, rand);
+      attempts += 1;
+    }
+    if (seed.takenNames.has(name)) {
+      name = name + Math.floor(rand() * 100);
+    }
+    seed.takenNames.add(name);
+  }
+
+  const isST: boolean = rand() < 0.05;
+  const isNew: boolean = rand() < 0.03;
+
+  // 涨跌幅限制按板块规则计算：主板 10%（ST 5%）、创业板/科创板 20%、北交所 30%
+  const { limitUpPercent, limitDownPercent } = getPriceLimit(board, isST);
+
+  const basePrice: number = 2 + Math.pow(rand(), 1.8) * 498;
+  const totalShares: number = (1 + rand() * 500) * 1e8;
+  const floatRatio: number = 0.3 + rand() * 0.6;
+  const floatShares: number = totalShares * floatRatio;
+  const marketCap: number = totalShares * basePrice;
+  const floatMarketCap: number = floatShares * basePrice;
+  const pe: number = isST ? -5 + rand() * 30 : 5 + Math.pow(rand(), 1.5) * 150;
+  const pb: number = 0.5 + rand() * 10;
+  const roe: number = -5 + rand() * 30;
+  const revenue: number = (1 + rand() * 2000) * 1e8;
+  const netProfit: number = revenue * (roe / 100);
+  const grossMargin: number = 0.1 + rand() * 0.7;
+
+  const conceptCount: number = 2 + Math.floor(rand() * 4);
+  const concept: string[] = pickMultiple(CONCEPTS, conceptCount, rand);
+  concept.push(industry);
+
+  const consecutiveDays: number = rand() < 0.1
+    ? 1 + Math.floor(rand() * 5)
+    : (rand() < 0.02 ? Math.floor(rand() * 10) : 0);
+
+  return {
+    code,
+    name: isST ? 'ST' + name.slice(0, Math.min(4, name.length)) : name,
+    market,
+    board,
+    isST,
+    isNew,
+    limitUpPercent,
+    limitDownPercent,
+    industry,
+    concept,
+    basePrice,
+    marketCap,
+    floatMarketCap,
+    pe,
+    pb,
+    totalShares,
+    floatShares,
+    roe,
+    revenue,
+    netProfit,
+    grossMargin,
+    consecutiveDays,
+  };
+}
+
+/**
+ * 按真实 A 股代码号段即时构造股票。
+ * 用途：用户搜索/自选/研究任意沪深主板、创业板、科创板、北交所代码时都能纳入监控，
+ * 不会因为代码不在预置股票池里而被判定为「不存在」。
+ * 非 A 股代码（B 股、新三板、基金等）抛错，由调用方转换为 404。
+ */
+export function buildMockStockForCode(codeInput: string): MockStock {
+  const info: { market: Market; board: Board } | null = classifyAShareCode(codeInput);
+  const code: string | null = normalizeStockCode(codeInput);
+  if (!info || !code) {
+    throw new Error(`不是有效的 A 股代码：${codeInput}`);
+  }
+  const rand: () => number = seededRandomForCode(code);
+  const industry: string = pickRandom(INDUSTRIES, rand);
+  return buildMockStock({ code, market: info.market, board: info.board, industry, rand });
+}
+
+/** 演示用真实标的：贵州茅台（沪市主板） */
+function buildBlueChipStock(): MockStock {
+  return {
+    code: '600519',
+    name: '贵州茅台',
+    market: 'sh',
+    board: 'main',
+    isST: false,
+    isNew: false,
+    limitUpPercent: 0.1,
+    limitDownPercent: 0.1,
+    industry: '白酒',
+    concept: ['白酒', '消费升级', '国酒', '高送转', '业绩预增'],
+    basePrice: 1680,
+    marketCap: 2.1e12,
+    floatMarketCap: 2.1e12,
+    pe: 28,
+    pb: 9,
+    totalShares: 12.56e8,
+    floatShares: 12.56e8,
+    roe: 32,
+    revenue: 1265e8,
+    netProfit: 627e8,
+    grossMargin: 0.91,
+    consecutiveDays: 0,
+  };
+}
+
 export function generateMockStocks(): MockStock[] {
   const rand: () => number = seededRandom(20240909);
   const stocks: MockStock[] = [];
   const usedCodes: Set<string> = new Set();
   const usedNames: Set<string> = new Set();
 
+  /**
+   * 生成并登记一只股票（板块 → 号段 的分配在下方主循环里完成）
+   * 字段构造统一走 buildMockStock，保证批量池与「按需纳入」两只路径完全一致
+   */
   function addStock(
     code: string,
-    market: 'sh' | 'sz' | 'bj',
-    board: 'main' | 'gem' | 'star' | 'bj',
+    market: Market,
+    board: Board,
     industry: string,
-  ): void {
-    if (usedCodes.has(code)) return;
-
-    let name: string = generateStockName(industry, rand);
-    let attempts: number = 0;
-    while (usedNames.has(name) && attempts < 20) {
-      name = generateStockName(industry, rand);
-      attempts += 1;
+  ): MockStock {
+    if (usedCodes.has(code)) {
+      throw new Error(`代码重复：${code}`);
     }
-    if (usedNames.has(name)) {
-      name = name + Math.floor(rand() * 100);
-    }
-    usedNames.add(name);
-    usedCodes.add(code);
-
-    const isST: boolean = rand() < 0.05;
-    const isNew: boolean = rand() < 0.03;
-
-    let limitUpPercent: number = 0.1;
-    let limitDownPercent: number = 0.1;
-    if (board === 'gem' || board === 'star') {
-      limitUpPercent = 0.2;
-      limitDownPercent = 0.2;
-    } else if (board === 'bj') {
-      limitUpPercent = 0.3;
-      limitDownPercent = 0.3;
-    }
-    if (isST) {
-      limitUpPercent = 0.05;
-      limitDownPercent = 0.05;
-    }
-
-    const basePrice: number = 2 + Math.pow(rand(), 1.8) * 498;
-    const totalShares: number = (1 + rand() * 500) * 1e8;
-    const floatRatio: number = 0.3 + rand() * 0.6;
-    const floatShares: number = totalShares * floatRatio;
-    const marketCap: number = totalShares * basePrice;
-    const floatMarketCap: number = floatShares * basePrice;
-    const pe: number = isST ? -5 + rand() * 30 : 5 + Math.pow(rand(), 1.5) * 150;
-    const pb: number = 0.5 + rand() * 10;
-    const roe: number = -5 + rand() * 30;
-    const revenue: number = (1 + rand() * 2000) * 1e8;
-    const netProfit: number = revenue * (roe / 100);
-    const grossMargin: number = 0.1 + rand() * 0.7;
-
-    const conceptCount: number = 2 + Math.floor(rand() * 4);
-    const concept: string[] = pickMultiple(CONCEPTS, conceptCount, rand);
-    concept.push(industry);
-
-    const consecutiveDays: number = rand() < 0.1
-      ? 1 + Math.floor(rand() * 5)
-      : (rand() < 0.02 ? Math.floor(rand() * 10) : 0);
-
-    stocks.push({
+    const stock: MockStock = buildMockStock({
       code,
-      name: isST ? 'ST' + name.slice(0, Math.min(4, name.length)) : name,
       market,
       board,
-      isST,
-      isNew,
-      limitUpPercent,
-      limitDownPercent,
       industry,
-      concept,
-      basePrice,
-      marketCap,
-      floatMarketCap,
-      pe,
-      pb,
-      totalShares,
-      floatShares,
-      roe,
-      revenue,
-      netProfit,
-      grossMargin,
-      consecutiveDays,
+      rand,
+      takenNames: usedNames,
     });
+    usedCodes.add(code);
+    stocks.push(stock);
+    return stock;
   }
 
-  let idx: number = 0;
-  for (const industry of INDUSTRIES) {
-    const perIndustry: number = 6 + Math.floor(rand() * 4);
+  // 主循环：按行业 × 板块（沪市主板/深市主板/创业板/科创板/北交所）分配股票，
+  // 每个板块内再按号段池轮转，保证 600/601/603/605、000/001/002/003、
+  // 300/301、688/689、430/830/870/920 等号段全部有覆盖，不会遗漏任何交易所板块。
+  const planCursors: Map<string, number> = new Map();
+  const codeCursors: Map<string, number> = new Map();
 
-    for (let i: number = 0; i < perIndustry; i += 1) {
-      idx += 1;
-      const codeNum: number = 600000 + idx;
-      addStock(String(codeNum).padStart(6, '0'), 'sh', 'main', industry);
+  const nextCode = (prefix: string): string => {
+    let seq: number = (codeCursors.get(prefix) ?? 0) + 1;
+    let candidate: string = prefix + String(seq).padStart(3, '0');
+    while (RESERVED_CODES.has(candidate) || usedCodes.has(candidate)) {
+      seq += 1;
+      if (seq > 999) {
+        throw new Error(`号段 ${prefix} 已分配完，请调整 TARGET_UNIVERSE_SIZE`);
+      }
+      candidate = prefix + String(seq).padStart(3, '0');
     }
+    codeCursors.set(prefix, seq);
+    return candidate;
+  };
 
-    for (let i: number = 0; i < perIndustry; i += 1) {
-      idx += 1;
-      const codeNum: number = idx < 500 ? 100 + idx : 300000 + idx - 500;
-      if (codeNum < 1000) {
-        addStock('000' + String(codeNum).padStart(3, '0'), 'sz', 'main', industry);
-      } else {
-        addStock(String(codeNum).padStart(6, '0'), 'sz', 'gem', industry);
+  for (const industry of INDUSTRIES) {
+    for (const plan of BOARD_PLANS) {
+      const planKey: string = `${plan.market}:${plan.board}`;
+      const weighted: number = Math.round(
+        (TARGET_UNIVERSE_SIZE * plan.weight) / INDUSTRIES.length,
+      );
+      const count: number = Math.max(plan.minPerIndustry, weighted + Math.floor(rand() * 2));
+
+      for (let i: number = 0; i < count; i += 1) {
+        const cursor: number = planCursors.get(planKey) ?? 0;
+        planCursors.set(planKey, cursor + 1);
+        const prefix: string = plan.prefixPool[cursor % plan.prefixPool.length];
+        addStock(nextCode(prefix), plan.market, plan.board, industry);
       }
     }
-
-    if (idx % 3 === 0) {
-      const starCode: string = '688' + String(100 + idx).padStart(3, '0');
-      addStock(starCode, 'sh', 'star', industry);
-    }
-
-    if (idx % 5 === 0) {
-      const bjCode: string = '8' + String(30000 + idx).padStart(5, '0');
-      addStock(bjCode, 'bj', 'bj', industry);
-    }
   }
 
-  if (!usedCodes.has('600519')) {
-    const maotaiIdx: number = stocks.findIndex((s: MockStock) => s.code === '600001');
-    if (maotaiIdx >= 0) {
-      stocks[maotaiIdx] = {
-        ...stocks[maotaiIdx],
-        code: '600519',
-        name: '贵州茅台',
-        industry: '白酒',
-        basePrice: 1680,
-        marketCap: 2.1e12,
-        floatMarketCap: 2.1e12,
-        pe: 28,
-        pb: 9,
-        roe: 32,
-        totalShares: 12.56e8,
-        floatShares: 12.56e8,
-        revenue: 1265e8,
-        netProfit: 627e8,
-        grossMargin: 0.91,
-        concept: ['白酒', '消费升级', '国酒', '高送转', '业绩预增'],
-        isST: false,
-        isNew: false,
-        market: 'sh',
-        board: 'main',
-        limitUpPercent: 0.1,
-        limitDownPercent: 0.1,
-        consecutiveDays: 0,
-      };
-      usedCodes.add('600519');
-    }
-  }
+  // 固定标的：贵州茅台（600519 已在 RESERVED_CODES 中预留）
+  const blueChip: MockStock = addStock('600519', 'sh', 'main', '白酒');
+  Object.assign(blueChip, buildBlueChipStock());
 
   return stocks;
 }
