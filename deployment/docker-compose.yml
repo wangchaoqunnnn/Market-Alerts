@@ -35,7 +35,8 @@ services:
     networks:
       - app-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      # 镜像内不再安装 curl，统一用 busybox 自带的 wget（HTTP 错误码返回非 0）
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -6,7 +6,9 @@
 #   2. npm 缓存挂载为 BuildKit cache —— 构建失败重试/重复构建不再重新下载 1500+ 个 tarball；
 #   3. 全程只联网安装一次 —— production 阶段直接复用构建阶段裁剪后的 node_modules；
 #   4. 镜像源可用 --build-arg 覆盖（云厂商内网源免流量更快），主源失败自动回退备用源；
-#   5. 强制 IPv4 优先 —— 云服务器 IPv6 不通时 npm 会一直等到超时（典型 ETIMEDOUT）。
+#   5. 强制 IPv4 优先 —— 云服务器 IPv6 不通时 npm 会一直等到超时（典型 ETIMEDOUT）；
+#   6. 全程不调用 apk —— Alpine 官方软件源在境内极慢且会 TLS 报错（实测卡 26 分钟失败），
+#      依赖均有预编译产物、健康检查用 busybox 自带 wget，因此不需要任何系统包。
 #
 # 注意：RUN --mount 需要 BuildKit（Docker 23+ 默认开启，docker compose 也默认走 BuildKit）。
 # ============================================
@@ -48,8 +50,13 @@ ENV NODE_OPTIONS=--dns-result-order=ipv4first
 
 WORKDIR /app
 
-# 构建所需的系统依赖（部分 native 包需要源码编译）
-RUN apk add --no-cache python3 make g++
+# 说明：依赖全部带预编译产物（package-lock 中不存在 gypfile / node-gyp / prebuild-install），
+# 因此不再安装 python3 / make / g++，也就不依赖 Alpine 官方软件源
+# —— 该源在境内极慢且会 TLS 报错（实测 apk 卡 26 分钟最终失败），是上一轮构建失败的原因。
+# 若将来引入需要源码编译的依赖，放开下面注释（并建议换成国内源）：
+# ARG APK_MIRROR=mirrors.aliyun.com
+# RUN sed -i "s#dl-cdn.alpinelinux.org#${APK_MIRROR}#g" /etc/apk/repositories \
+#     && apk add --no-cache python3 make g++
 
 # 先复制包管理文件，利用 Docker 层缓存（package.json 不变则这一层及安装层可复用）
 COPY package.json package-lock.json ./
@@ -113,8 +120,8 @@ ENV NODE_ENV=production \
 # 行情数据源多为国内公网接口，同样强制 IPv4 优先，避免 IPv6 黑洞导致请求超时
 ENV NODE_OPTIONS=--dns-result-order=ipv4first
 
-# 安装健康检查所需的 curl
-RUN apk add --no-cache curl
+# 健康检查改用 busybox 自带的 wget，无需再安装 curl
+# （不装任何 apk 包 = 运行阶段完全不依赖 Alpine 软件源，镜像更小、构建更稳）
 
 # 创建非 root 用户（提升安全性）
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
@@ -133,10 +140,10 @@ USER appuser
 # 暴露端口
 EXPOSE 3000
 
-# 健康检查：轮询 /api/health 端点
+# 健康检查：轮询 /api/health 端点（busybox wget，HTTP 错误码会返回非 0）
 # 间隔 30 秒，超时 5 秒，重试 3 次后标记为 unhealthy
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20s \
-  CMD curl -f http://127.0.0.1:3000/api/health || exit 1
+  CMD wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1
 
 # 启动命令：直接用 node 启动，减少 npm 中间进程
 CMD ["node", "dist/server/main.js"]

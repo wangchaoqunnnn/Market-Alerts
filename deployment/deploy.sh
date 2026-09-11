@@ -66,6 +66,17 @@ ensure_env_file() {
   fi
 }
 
+# 健康检查请求（宿主机可能只装了 wget，做兼容处理）
+http_health_ok() {
+  if command -v curl > /dev/null 2>&1; then
+    curl -sf "$HEALTH_URL" > /dev/null 2>&1
+  elif command -v wget > /dev/null 2>&1; then
+    wget -q -O /dev/null "$HEALTH_URL" > /dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
 # 等待健康检查通过
 wait_for_health() {
   echo ""
@@ -74,7 +85,7 @@ wait_for_health() {
   local interval=3
 
   while [ "$count" -lt "$HEALTH_TIMEOUT" ]; do
-    if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+    if http_health_ok; then
       print_success "服务健康检查通过"
       return 0
     fi

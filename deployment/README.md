@@ -472,7 +472,8 @@ cd deployment && docker compose up -d --no-build
 | 错误现象 | 可能原因 | 解决方法 |
 |----------|----------|----------|
 | `RUN --mount` 报语法错误 | Docker 过旧（< 23）/未启用 BuildKit | 升级 Docker 到 23+，或安装 buildx 后 `DOCKER_BUILDKIT=1` |
-| `node-gyp` 编译失败 | 缺少编译工具 | Dockerfile 已包含 python3/make/g++ |
+| `apk add` 卡住/报 `TLS: unspecified error` | Alpine 官方软件源在境内极慢或不稳定 | **当前 Dockerfile 已不再调用 apk**（依赖均有预编译产物、健康检查用自带 wget）。若自行新增需编译的依赖，请先换国内源：`sed -i "s#dl-cdn.alpinelinux.org#mirrors.aliyun.com#g" /etc/apk/repositories` |
+| `node-gyp` 编译失败 | 引入了需要源码编译的依赖 | 默认依赖无需编译；如确需编译，请在 builder 阶段放开 Dockerfile 中注释的 `apk add python3 make g++`（并配合国内源） |
 | 构建上下文异常大（几百 MB） | `.dockerignore` 失效 | 确保仓库**根目录**存在 `.dockerignore`（放在 `deployment/` 下不会被读取） |
 
 ### 5. 行情数据不更新
