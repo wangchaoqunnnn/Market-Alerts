@@ -26,6 +26,8 @@ COPY shared ./shared
 COPY nest-cli.json ./
 COPY tsconfig*.json ./
 COPY vite.config.ts ./
+COPY tailwind.config.ts ./
+COPY postcss.config.js ./
 
 # 执行生产构建
 RUN npm run build:prod
