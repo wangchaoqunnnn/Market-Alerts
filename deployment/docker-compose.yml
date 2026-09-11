@@ -8,10 +8,15 @@ services:
       context: ..
       dockerfile: deployment/Dockerfile
       args:
-        # npm 镜像源：国内服务器可换成云厂商内网源（免流量、更稳），例如
-        #   NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/ ./deploy.sh build
+        # 以下 4 项都可在 deployment/.env 里配置（compose 会自动读取），
+        # 或在命令行用环境变量覆盖：NPM_REGISTRY=... ./deploy.sh build
+        # npm 镜像源（云厂商内网源免流量且更快）
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         NPM_FALLBACK_REGISTRY: ${NPM_FALLBACK_REGISTRY:-https://registry.npmjs.org}
+        # npm 并发连接数（内网源可调到 16-32 提速；公网源建议 <= 8 避免被限流）
+        NPM_MAXSOCKETS: ${NPM_MAXSOCKETS:-6}
+        # 基础镜像（境内拉 Docker Hub 慢时换成国内镜像仓库前缀）
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
     container_name: market-anomaly-monitor
     restart: unless-stopped
     ports:
@@ -46,7 +51,9 @@ services:
   # PostgreSQL 数据库
   # ============================================
   db:
-    image: postgres:16-alpine
+    # 境内拉取 Docker Hub 慢时，可在 .env 里把镜像换成国内仓库前缀
+    # 例如 POSTGRES_IMAGE=docker.m.daocloud.io/library/postgres:16-alpine
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
     container_name: market-anomaly-db
     restart: unless-stopped
     environment:

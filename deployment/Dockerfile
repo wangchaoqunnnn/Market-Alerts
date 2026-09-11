@@ -16,7 +16,15 @@
 # ============================================
 # Stage 1: Builder —— 安装依赖并编译前后端
 # ============================================
-FROM node:22-alpine AS builder
+
+# 基础镜像可换成国内镜像仓库前缀（境内拉取 Docker Hub 很慢时用）：
+#   已实测可用：docker.m.daocloud.io / docker.1ms.run / hub.rat.dev
+#   云厂商内网：ccr.ccs.tencentyun.com（腾讯云）、swr.cn-north-4.myhuaweicloud.com（华为云）
+# 用法：--build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine
+#   或在 deployment/.env 里写 NODE_IMAGE=...，compose 会自动读取
+ARG NODE_IMAGE=node:22-alpine
+
+FROM ${NODE_IMAGE} AS builder
 
 # 镜像源（国内服务器建议换成云厂商内网源，免流量且更稳）：
 #   腾讯云：https://mirrors.cloud.tencent.com/npm/
@@ -25,6 +33,9 @@ FROM node:22-alpine AS builder
 # 用法：docker compose build --build-arg NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG NPM_FALLBACK_REGISTRY=https://registry.npmjs.org
+# 并发连接数：公网镜像源默认 6（避免被限流/重置）；
+# 走云厂商内网源时链路稳定，可调到 16-32 显著提速（--build-arg NPM_MAXSOCKETS=24）
+ARG NPM_MAXSOCKETS=6
 
 # npm 行为统一在这里配置：
 #   replace_registry_host=always  lockfile 中写死了 npmmirror 的 tarball 地址，
@@ -35,7 +46,7 @@ ARG NPM_FALLBACK_REGISTRY=https://registry.npmjs.org
 #   prefer_offline=true           已下载过的一律走缓存，显著减少网络请求
 ENV npm_config_registry=$NPM_REGISTRY \
     npm_config_replace_registry_host=always \
-    npm_config_maxsockets=6 \
+    npm_config_maxsockets=$NPM_MAXSOCKETS \
     npm_config_fetch_timeout=180000 \
     npm_config_fetch_retries=8 \
     npm_config_fetch_retry_mintimeout=5000 \
@@ -108,7 +119,7 @@ RUN --mount=type=cache,id=npm-cache,target=/root/.npm,sharing=locked \
 # ============================================
 # Stage 2: Runner —— 仅保留生产依赖与编译产物
 # ============================================
-FROM node:22-alpine AS production
+FROM ${NODE_IMAGE} AS production
 
 WORKDIR /app
 

@@ -76,15 +76,27 @@ vi .env
 
 ### 3. 构建并启动（二选一）
 
+> **境内服务器下载慢？** 先做两步加速（都是可选的，不做也能构建）：
+> ```bash
+> # ① 让 docker pull 走国内镜像加速器（一次配置，长期生效；自动备份原配置）
+> sudo ./setup-docker-mirror.sh            # 腾讯云 CVM 加 --tencent，华为云加 --huawei
+> # ② 让 npm 走云厂商内网源 + 提高并发（写进 .env，compose 自动读取）
+> #    .env 中：NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/  NPM_MAXSOCKETS=24
+> #    基础镜像也可换国内仓库：NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine
+> ```
+> 详细说明见「国内源加速」章节。
+
 **方式 A：服务器直接构建**（简单，需要 npm 网络通畅）
 
 ```bash
 cd /opt/market-alerts/deployment
-NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/ ./deploy.sh build
+NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/ NPM_MAXSOCKETS=24 ./deploy.sh build
 ```
 
-> 腾讯云用 `https://mirrors.cloud.tencent.com/npm/`，华为云用 `https://repo.huaweicloud.com/repository/npm/`，
-> 其他可省略该变量走默认 npmmirror。脚本会自动：构建镜像 → 启动 app+db → 轮询健康检查。
+> 若提示 `Permission denied`，先执行 `chmod +x deploy.sh setup-docker-mirror.sh`。
+> 腾讯云用 `mirrors.cloud.tencent.com/npm/`，华为云用 `repo.huaweicloud.com/repository/npm/`，
+> 阿里云 ECS 用 `mirrors.cloud.aliyuncs.com/npm/`（内网，免流量），其他可省略该变量走默认 npmmirror。
+> 脚本会自动：构建镜像 → 启动 app+db → 轮询健康检查。
 
 **方式 B：本地构建 → 上传镜像**（服务器网络差或配置低时推荐）
 
@@ -343,6 +355,55 @@ docker run --rm \
 ```
 
 > 💡 建议每日定时备份，可使用 cron 或 Docker 内置的 cron 服务。
+
+---
+
+## 国内源加速（下载慢时必看）
+
+构建过程有两个下载环节，分别加速：
+
+### 1. 基础镜像（docker pull）
+
+Docker Hub 在境内通常很慢，两种办法任选其一：
+
+**A. 配置镜像加速器（一次配置，之后所有 pull 都生效）**
+
+```bash
+sudo ./setup-docker-mirror.sh            # 公共加速器（已实测可用）
+sudo ./setup-docker-mirror.sh --tencent  # 腾讯云 CVM：走内网加速器，免流量最快
+sudo ./setup-docker-mirror.sh --huawei   # 华为云 ECS
+```
+
+脚本会自动备份已有 `/etc/docker/daemon.json`、写入 `registry-mirrors`、重启 Docker 并验证。
+已实测可用的公共加速器：`docker.m.daocloud.io`、`docker.1ms.run`、`hub.rat.dev`。
+
+**B. 直接用国内仓库前缀（不改 Docker 配置，适合单机临时用）**
+
+在 `deployment/.env` 里写：
+
+```bash
+NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine
+POSTGRES_IMAGE=docker.m.daocloud.io/library/postgres:16-alpine
+```
+
+### 2. npm 依赖（1500+ 个包、约 400MB，构建耗时大头）
+
+| 手段 | 做法 |
+|------|------|
+| 换云厂商内网源 | `.env`：`NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/`（腾讯）/ `https://repo.huaweicloud.com/repository/npm/`（华为）/ `https://mirrors.cloud.aliyuncs.com/npm/`（阿里 ECS 内网，免流量） |
+| 提高并发 | 内网源把 `NPM_MAXSOCKETS` 从 6 调到 **16-32**；公网源保持 ≤ 8（npmmirror 会限流/重置） |
+| 复用缓存 | 已内置 BuildKit 缓存挂载：**失败重试或重复构建不会重新下载已下好的包**，第一次慢属正常，后续构建会快很多 |
+| 彻底绕过 | 本地构建镜像后 `docker save` 传输（见「方式 B」），服务器完全不碰 npm |
+
+> 实测参考：本机约 0.6MB/s 链路上，各公共 npm 镜像速度相近（瓶颈在带宽而非镜像源本身）；
+> 云厂商内网源通常 10MB/s 以上，是提速最明显的一项。
+
+### 3. 已内置的其他优化（无需配置）
+
+- **不使用任何 apk 系统包**（依赖均带预编译产物、健康检查用 busybox wget），不受 Alpine 官方源影响
+- `.dockerignore` 位于仓库根目录，构建上下文约 2MB（不会把 node_modules 传给 Docker）
+- `npm ci` 按 lockfile 精确安装、`--no-audit --no-fund`、`prefer-offline`
+- 只联网安装一次：运行阶段复用构建阶段裁剪后的 `node_modules`
 
 ---
 
