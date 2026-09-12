@@ -668,7 +668,7 @@ docker compose logs app
 ### Docker Compose 升级
 
 ```bash
-cd deployment
+cd /opt/market-alerts/deployment
 
 # 拉取最新代码
 git pull
@@ -680,6 +680,45 @@ git pull
 docker compose ps
 curl http://localhost:3000/api/health
 ```
+
+### 服务器上有本地改动导致 `git pull` 被拒绝
+
+报错形如：
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        deployment/deploy.sh
+Please commit your changes or stash them before you merge.
+Aborting
+```
+
+**先看改的是什么**（多数情况只是文件权限位，因为早期版本 `deploy.sh` 在 Git 里没有可执行位，
+服务器上手工 `chmod +x` 过）：
+
+```bash
+cd /opt/market-alerts
+git status
+git diff deployment/deploy.sh
+# 若输出是 "old mode 100644 / new mode 100755"，说明只是权限位，不是内容改动
+```
+
+**按情况处理：**
+
+```bash
+# ① 只是权限位 / 不需要保留本地改动 → 丢弃后拉取
+git checkout -- deployment/deploy.sh
+git pull
+ls -l deployment/deploy.sh          # 现在应为 -rwxr-xr-x（Git 中已是 100755）
+
+# ② 确实手工改过内容（比如改了默认镜像源）→ 暂存后拉取，再决定是否保留
+git stash push -m "server-local deploy.sh" -- deployment/deploy.sh
+git pull
+git stash pop                        # 有冲突则手动合并；不需要本地改动就丢弃：git stash drop
+```
+
+> 建议：服务器上**不要手动编辑被 Git 跟踪的文件**（`deploy.sh`、`docker-compose.yml`、
+> `Dockerfile` 等）。所有环境差异都写进 `deployment/.env`（该文件已被 `.gitignore` 忽略，
+> 不会与 `git pull` 冲突）。
 
 ---
 
