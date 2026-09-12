@@ -99,6 +99,39 @@ wait_for_health() {
   return 1
 }
 
+# 预检基础镜像：缺失时先拉取（限时 5 分钟），避免构建长期卡在 registry 元数据解析上
+# 典型症状：docker compose build 长时间只显示转圈，最后报
+#           DeadlineExceeded: context deadline exceeded
+ensure_base_image() {
+  local image="$1"
+  if docker image inspect "$image" > /dev/null 2>&1; then
+    print_success "基础镜像已存在：${image}"
+    return 0
+  fi
+
+  print_warn "本地缺少基础镜像 ${image}，尝试拉取（最长等待 5 分钟）..."
+  if timeout 300 docker pull "$image"; then
+    print_success "基础镜像拉取完成：${image}"
+    return 0
+  fi
+
+  print_error "基础镜像拉取失败或超时：${image}"
+  echo ""
+  echo "  原因：境内访问 Docker Hub（registry-1.docker.io）经常超时，"
+  echo "        构建会一直卡在拉取基础镜像/解析镜像元数据这一步。"
+  echo ""
+  echo "  解决方式（任选其一）："
+  echo "   A. 配置镜像加速器（推荐，一次配置长期生效）："
+  echo "      sudo ${SCRIPT_DIR}/setup-docker-mirror.sh            # 公共加速器"
+  echo "      sudo ${SCRIPT_DIR}/setup-docker-mirror.sh --tencent  # 腾讯云 CVM"
+  echo "   B. 在 ${ENV_FILE} 里把基础镜像换成国内仓库前缀："
+  echo "      NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine"
+  echo "      POSTGRES_IMAGE=docker.m.daocloud.io/library/postgres:16-alpine"
+  echo "   C. 手动验证网络：docker pull ${image}"
+  echo ""
+  return 1
+}
+
 # 打印错误日志尾部
 print_error_logs() {
   echo ""
@@ -260,7 +293,28 @@ fi
 print_step 3 5 "${ACTION}镜像..."
 
 if [ "$CMD" = "build" ]; then
-  docker compose -f "$COMPOSE_FILE" build app
+  BASE_IMAGE="$(read_env_var NODE_IMAGE node:22-alpine)"
+  ensure_base_image "$BASE_IMAGE" || exit 1
+
+  # 直接用 docker build（不再走 compose/bake）：
+  #   1) bake 路径在卡住时只显示转圈，无法定位；docker build 支持 --progress=plain，
+  #      每一步（COPY / RUN npm ci / vite build）都会实时打印；
+  #   2) 构建参数从 .env 读取，与 docker-compose.yml 的 build.args 保持一致。
+  print_warn "开始构建镜像（plain 进度输出；首次构建需下载 1500+ 个 npm 包，可能较久）..."
+  BUILDKIT_PROGRESS=plain docker build \
+    --progress=plain \
+    -t market-anomaly-monitor:latest \
+    -f "${SCRIPT_DIR}/Dockerfile" \
+    --build-arg "NODE_IMAGE=${BASE_IMAGE}" \
+    --build-arg "NPM_REGISTRY=$(read_env_var NPM_REGISTRY https://registry.npmmirror.com)" \
+    --build-arg "NPM_FALLBACK_REGISTRY=$(read_env_var NPM_FALLBACK_REGISTRY https://registry.npmjs.org)" \
+    --build-arg "NPM_MAXSOCKETS=$(read_env_var NPM_MAXSOCKETS 6)" \
+    "${SCRIPT_DIR}/.." || {
+      print_error "镜像构建失败：请查看上方最后一步的输出定位问题"
+      echo "  卡在 npm 下载 → 检查 .env 的 NPM_REGISTRY / NPM_MAXSOCKETS（详见 README「国内源加速」）"
+      echo "  卡在 apk/基础镜像 → 执行 sudo ${SCRIPT_DIR}/setup-docker-mirror.sh"
+      exit 1
+    }
 elif [ "$CMD" = "pull" ]; then
   docker compose -f "$COMPOSE_FILE" pull app || print_warn "拉取镜像失败，将使用本地镜像"
 fi

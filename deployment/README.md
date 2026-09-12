@@ -612,8 +612,29 @@ cd deployment && docker compose up -d --no-build
 |----------|----------|----------|
 | `RUN --mount` 报语法错误 | Docker 过旧（< 23）/未启用 BuildKit | 升级 Docker 到 23+，或安装 buildx 后 `DOCKER_BUILDKIT=1` |
 | `apk add` 卡住/报 `TLS: unspecified error` | Alpine 官方软件源在境内极慢或不稳定 | **当前 Dockerfile 已不再调用 apk**（依赖均有预编译产物、健康检查用自带 wget）。若自行新增需编译的依赖，请先换国内源：`sed -i "s#dl-cdn.alpinelinux.org#mirrors.aliyun.com#g" /etc/apk/repositories` |
+| `DeadlineExceeded: context deadline exceeded`（长时间只显示转圈，最后失败） | 构建卡在拉取基础镜像 / 解析镜像元数据（境内访问 Docker Hub 超时） | ① `sudo ./setup-docker-mirror.sh` 配置镜像加速器；② 或在 `.env` 里把 `NODE_IMAGE` / `POSTGRES_IMAGE` 换成国内仓库前缀（见「国内源加速」）。`./deploy.sh build` 现在会**先预检基础镜像**（缺失则限时拉取）并**实时打印每一步**，不再出现无输出的长时间等待 |
 | `node-gyp` 编译失败 | 引入了需要源码编译的依赖 | 默认依赖无需编译；如确需编译，请在 builder 阶段放开 Dockerfile 中注释的 `apk add python3 make g++`（并配合国内源） |
 | 构建上下文异常大（几百 MB） | `.dockerignore` 失效 | 确保仓库**根目录**存在 `.dockerignore`（放在 `deployment/` 下不会被读取） |
+
+**构建卡住 / 长时间没有任何输出，怎么定位？**
+
+```bash
+cd /opt/market-alerts
+
+# 1) 确认基础镜像是否已在本地（缺失会先去 registry 拉，境内常超时）
+docker images | grep -E 'node|postgres'
+timeout 60 docker pull node:22-alpine
+
+# 2) 用 plain 进度手动构建，每一步都会实时打印，卡在哪一步一目了然
+BUILDKIT_PROGRESS=plain docker build --progress=plain -t market-anomaly-monitor:latest \
+  -f deployment/Dockerfile .
+
+# 3) 如果用的是 docker compose build（走 buildx bake），可先关掉 bake 再试
+COMPOSE_BAKE=false docker compose build app
+```
+
+> `./deploy.sh build` 已经内置了上面第 1、2 步：先预检并拉取基础镜像（限时 5 分钟，失败直接给出解法），
+> 再用 `docker build --progress=plain` 构建，输出完整可见。
 
 ### 5. 行情数据不更新
 
